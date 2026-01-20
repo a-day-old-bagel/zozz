@@ -1,0 +1,12 @@
+.{
+    .name = .zozz,
+    .version = "0.14.0",
+    .minimum_zig_version = "0.14.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "libs",
+        "src",
+        "README.md",
+    },
+}
