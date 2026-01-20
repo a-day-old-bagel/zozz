@@ -1,5 +1,6 @@
 .{
     .name = .zozz,
+    .fingerprint = 0x34d1aa7660ee962,
     .version = "0.14.0",
     .minimum_zig_version = "0.14.0",
     .paths = .{

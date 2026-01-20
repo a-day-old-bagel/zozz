@@ -16,10 +16,9 @@ pub fn build(b: *std.Build) void {
     });
     zozz_offline.addIncludePath(b.path("cozz"));
 
-    const cpp_flags: []const []const u8 = &.{
-        "-std=c++17",
-        "-fno-exceptions",
-    };
+    //
+    // C++
+    //
 
     const cozz_runtime = b.addStaticLibrary(.{
         .name = "cozz_runtime",
@@ -32,11 +31,13 @@ pub fn build(b: *std.Build) void {
         .files = &.{
             "cozz/cozz_runtime.cpp",
 
-            "ozz/src_fused/ozz_animation.cpp",
-            // "ozz/src_fused/ozz_base.cpp",
-            // "ozz/src_fused/ozz_geometry.cpp",
+            "ozz/src_fused/ozz_animation.cc",
+            "ozz/src_fused/ozz_base.cc",
         },
-        .flags = cpp_flags,
+        .flags = &.{
+            "-std=c++20",
+            "-fno-exceptions",
+        },
     });
     cozz_runtime.linkLibC();
     cozz_runtime.linkLibCpp();
@@ -48,14 +49,19 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(cozz_offline);
     cozz_offline.addIncludePath(b.path("ozz/include"));
+    cozz_offline.addIncludePath(b.path("libs"));
     cozz_offline.addCSourceFiles(.{
         .files = &.{
             "cozz/cozz_offline.cpp",
 
-            "ozz/src_fused/ozz_animation_offline.cpp",
-            "ozz/src_fused/ozz_animation_tools.cpp",
+            "ozz/src_fused/ozz_animation_offline.cc",
+            "ozz/src_fused/ozz_animation_tools.cc",
+
+            "libs/jsoncpp.cpp",
         },
-        .flags = cpp_flags,
+        .flags = &.{
+            "-std=c++20",
+        },
     });
     cozz_offline.linkLibC();
     cozz_offline.linkLibCpp();
