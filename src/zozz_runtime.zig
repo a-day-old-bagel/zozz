@@ -290,37 +290,46 @@ pub const Instance = struct {
     }
 };
 
-pub fn createLayerScratchBuffers(alloc: Alloc, skel: Skeleton, comptime num_layers: usize) OzzError![num_layers][]u8 {
-    const bytes = skel.soaLocalsBytes();
-    const alignment = Skeleton.soaLocalsAlign();
+// pub fn allocLayerScratch(alloc: Alloc, skel: Skeleton) OzzError![]u8 {
+//     const bytes = skel.soaLocalsBytes();
+//     const alignment = Skeleton.soaLocalsAlign();
+//     return alloc.alignedAlloc(u8, alignment, bytes) catch return OzzError.OutOfMemory;
+// }
 
-    var scratch: [num_layers][]u8 = undefined;
+// pub fn createLayerScratchBuffers(alloc: Alloc, skel: Skeleton, comptime num_layers: usize) OzzError![num_layers][]u8 {
+//     const bytes = skel.soaLocalsBytes();
+//     const alignment = Skeleton.soaLocalsAlign();
 
-    return scratch;
-}
+//     var scratch: [num_layers]?[]u8 = &.{ null ** num_layers };
+//     inline for (scratch.items) |*entry| {
+//         entry = alloc.alignedAlloc(u8, alignment, bytes) catch return OzzError.OutOfMemory;
+//     }
 
-pub const LayerScratch = struct {
-    sampled: [Instance.MaxLayers][]u8,
+//     return scratch;
+// }
 
-    pub fn initOwned(
-        allocator: std.mem.Allocator,
-        skel: Skeleton,
-    ) OzzError!LayerScratch {
-        const bytes = skel.soaLocalsBytes();
-        const alignment = Skeleton.soaLocalsAlign();
+// pub const LayerScratch = struct {
+//     sampled: [Instance.MaxLayers][]u8,
 
-        const self: LayerScratch = undefined;
-        for (self.sampled) |*buf| {
-            buf.* = allocator.alignedAlloc(u8, alignment, bytes) catch return OzzError.OutOfMemory;
-        }
-        return self;
-    }
+//     pub fn initOwned(
+//         allocator: std.mem.Allocator,
+//         skel: Skeleton,
+//     ) OzzError!LayerScratch {
+//         const bytes = skel.soaLocalsBytes();
+//         const alignment = Skeleton.soaLocalsAlign();
 
-    pub fn deinitOwned(self: *LayerScratch, allocator: std.mem.Allocator) void {
-        for (self.sampled) |buf| allocator.free(buf);
-        self.* = undefined;
-    }
-};
+//         const self: LayerScratch = undefined;
+//         for (self.sampled) |*buf| {
+//             buf.* = allocator.alignedAlloc(u8, alignment, bytes) catch return OzzError.OutOfMemory;
+//         }
+//         return self;
+//     }
+
+//     pub fn deinitOwned(self: *LayerScratch, allocator: std.mem.Allocator) void {
+//         for (self.sampled) |buf| allocator.free(buf);
+//         self.* = undefined;
+//     }
+// };
 
 // --------------------
 // Tests
@@ -408,7 +417,6 @@ test "ozz C ABI wrapper: load + 2-clip blend + 3x4 palette is sane" {
     try std.testing.expect(any_nonzero);
 
     // ---- Determinism check: same inputs twice => identical output ----
-    // (This should hold for your wrapper if inputs and buffers are identical.)
     const palette_before = try gpa.dupe(f32, palette1);
     defer gpa.free(palette_before);
 
@@ -428,8 +436,5 @@ test "ozz wrapper: invalid layer count fails" {
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
-    // You can skip asset loading here; just create a dummy expectation that the function rejects.
-    // But Instance needs a real skeleton to exist, so this test is left as a placeholder.
     _ = gpa;
-    // Intentionally empty: Once you have assets, you can flesh this out.
 }
