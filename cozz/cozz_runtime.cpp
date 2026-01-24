@@ -20,6 +20,7 @@
 #include "ozz/base/maths/soa_transform.h"
 #include "ozz/base/maths/soa_float4x4.h"
 #include "ozz/base/maths/simd_math.h"
+#include "ozz/base/maths/simd_quaternion.h"
 #include "ozz/base/span.h"
 #include "ozz/base/maths/vec_float.h"
 
@@ -233,29 +234,37 @@ int32_t ozz_workspace_palette_floats(const ozz_workspace_t* ws) { return ws ? (1
 // ---- helpers ----
 static inline float wrap_or_clamp(float t, float dur, int wrap) {
   if (dur <= 0.0f) return 0.0f;
-  if (wrap) { t = std::fmod(t, dur); if (t < 0.0f) t += dur; return t; }
+  if (wrap) {
+    t = std::fmod(t, dur);
+    if (t < 0.0f) t += dur;
+    return t;
+  }
   if (t < 0.0f) return 0.0f;
   if (t > dur) return dur;
   return t;
 }
 
+// Store packed column-major 3x4 (12 floats) from Float4x4 columns.
+// Offsets +3/+6/+9 are NOT 16-byte aligned -> must use Store3PtrU.
 static inline void store_3x4_col_major(const ozz::math::Float4x4& m, float* out12) {
-  alignas(16) float c0[4], c1[4], c2[4], c3[4];
-  ozz::math::Store3PtrU(m.cols[0], c0);
-  ozz::math::Store3PtrU(m.cols[1], c1);
-  ozz::math::Store3PtrU(m.cols[2], c2);
-  ozz::math::Store3PtrU(m.cols[3], c3);
-  out12[0]=c0[0]; out12[1]=c0[1]; out12[2]=c0[2];
-  out12[3]=c1[0]; out12[4]=c1[1]; out12[5]=c1[2];
-  out12[6]=c2[0]; out12[7]=c2[1]; out12[8]=c2[2];
-  out12[9]=c3[0]; out12[10]=c3[1]; out12[11]=c3[2];
+  ozz::math::Store3PtrU(m.cols[0], out12 + 0);
+  ozz::math::Store3PtrU(m.cols[1], out12 + 3);
+  ozz::math::Store3PtrU(m.cols[2], out12 + 6);
+  ozz::math::Store3PtrU(m.cols[3], out12 + 9);
 }
 
-static inline ozz::math::Float3 f3(const ozz_vec3_t& v) { return ozz::math::Float3(v.x, v.y, v.z); }
+static inline ozz::math::SimdFloat4 load3(float x, float y, float z, float w) {
+  return ozz::math::simd_float4::Load(x, y, z, w);
+}
 
-static ozz_result_t sample_into(ozz_instance_t* inst, const ozz_animation_t* anim_h, float time_s, int wrap, ozz::math::SoaTransform* out) {
+static inline ozz_result_t sample_into(ozz_instance_t* inst,
+                                       const ozz_animation_t* anim_h,
+                                       float time_s,
+                                       int wrap,
+                                       ozz::math::SoaTransform* out) {
   if (!anim_h) return OZZ_ERR_INVALID_ARGUMENT;
-  if ((int32_t)anim_h->anim.num_tracks() != inst->num_joints) return OZZ_ERR_INVALID_ARGUMENT;
+  if ((int32_t)anim_h->anim.num_tracks() != inst->num_joints)
+    return OZZ_ERR_INVALID_ARGUMENT;
 
   const float dur = anim_h->anim.duration();
   const float t = wrap_or_clamp(time_s, dur, wrap);
@@ -270,7 +279,9 @@ static ozz_result_t sample_into(ozz_instance_t* inst, const ozz_animation_t* ani
   return job.Run() ? OZZ_OK : OZZ_ERR_OZZ;
 }
 
-static ozz_result_t locals_to_model(const ozz_instance_t* inst, const ozz::math::SoaTransform* locals, ozz::math::Float4x4* out_model) {
+static inline ozz_result_t locals_to_model(const ozz_instance_t* inst,
+                                           const ozz::math::SoaTransform* locals,
+                                           ozz::math::Float4x4* out_model) {
   ozz::animation::LocalToModelJob job;
   job.skeleton = inst->skel;
   job.input = ozz::span<const ozz::math::SoaTransform>(locals, inst->num_soa);
@@ -278,123 +289,243 @@ static ozz_result_t locals_to_model(const ozz_instance_t* inst, const ozz::math:
   return job.Run() ? OZZ_OK : OZZ_ERR_OZZ;
 }
 
+// Apply a SimdQuaternion correction to a single joint lane in SoA locals.
+// Mirrors the logic used by the look-at sample helper.
+static inline void apply_joint_rotation_correction(
+    int32_t joint,
+    const ozz::math::SimdQuaternion& corr,
+    ozz::math::SoaTransform* locals,
+    int32_t num_soa) {
+
+  const int32_t soa = joint >> 2;
+  const int32_t lane = joint & 3;
+  if (soa < 0 || soa >= num_soa) return;
+
+  // Extract SoA lane -> scalar
+  alignas(16) float xs[4], ys[4], zs[4], ws[4];
+  ozz::math::StorePtr(locals[soa].rotation.x, xs);
+  ozz::math::StorePtr(locals[soa].rotation.y, ys);
+  ozz::math::StorePtr(locals[soa].rotation.z, zs);
+  ozz::math::StorePtr(locals[soa].rotation.w, ws);
+
+  // Build local quaternion (SIMD)
+  ozz::math::SimdQuaternion local_q = {
+      ozz::math::simd_float4::Load(xs[lane], ys[lane],
+                                   zs[lane], ws[lane])};
+
+  // Multiply & normalize using ozz helpers
+  const ozz::math::SimdQuaternion out =
+      ozz::math::Normalize(corr * local_q);
+
+  // Write back
+  alignas(16) float out4[4];
+  ozz::math::StorePtr(out.xyzw, out4);
+
+  xs[lane] = out4[0];
+  ys[lane] = out4[1];
+  zs[lane] = out4[2];
+  ws[lane] = out4[3];
+
+  locals[soa].rotation.x = ozz::math::simd_float4::LoadPtr(xs);
+  locals[soa].rotation.y = ozz::math::simd_float4::LoadPtr(ys);
+  locals[soa].rotation.z = ozz::math::simd_float4::LoadPtr(zs);
+  locals[soa].rotation.w = ozz::math::simd_float4::LoadPtr(ws);
+}
+
 // ---- main eval ----
 ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
   ozz_clear_error();
-  if (!inst || !ws) return set_err(OZZ_ERR_INVALID_ARGUMENT, "null inst/ws");
-  if (inst->skel != ws->skel) return set_err(OZZ_ERR_INVALID_ARGUMENT, "inst/ws skeleton mismatch");
-  if (inst->num_joints != ws->num_joints) return set_err(OZZ_ERR_INVALID_ARGUMENT, "inst/ws size mismatch");
-
-  if (inst->layer_count <= 0) return set_err(OZZ_ERR_INVALID_ARGUMENT, "no layers");
+  if (!inst || !ws)
+    return set_err(OZZ_ERR_INVALID_ARGUMENT, "null inst/ws");
+  if (inst->skel != ws->skel)
+    return set_err(OZZ_ERR_INVALID_ARGUMENT, "skeleton mismatch");
+  if (inst->num_joints != ws->num_joints)
+    return set_err(OZZ_ERR_INVALID_ARGUMENT, "size mismatch");
+  if (inst->layer_count <= 0)
+    return set_err(OZZ_ERR_INVALID_ARGUMENT, "no layers");
 
   bool have_normal = false;
   float sum_normal = 0.0f;
 
-  // 1) accumulate normal layers into inst->accum using ws->temp as scratch
+  // 1) normal layers
   for (int32_t i = 0; i < inst->layer_count; ++i) {
     const ozz_layer_desc_t& L = inst->layers[i];
-    if (!L.anim || L.weight <= 0.0f) continue;
+    if (!L.anim || L.weight <= 0.f) continue;
     if (L.mode == OZZ_LAYER_ADDITIVE) continue;
 
-    ozz_result_t r = sample_into(inst, L.anim, L.time_seconds, L.wrap_time, ws->temp);
+    ozz_result_t r =
+        sample_into(inst, L.anim, L.time_seconds, L.wrap_time, ws->temp);
     if (r != OZZ_OK) return set_err(r, "sample failed");
 
     if (!have_normal) {
-      std::memcpy(inst->accum, ws->temp, sizeof(ozz::math::SoaTransform) * (size_t)inst->num_soa);
+      std::memcpy(inst->accum, ws->temp,
+                  sizeof(ozz::math::SoaTransform) *
+                      (size_t)inst->num_soa);
       have_normal = true;
       sum_normal = L.weight;
     } else {
       ozz::animation::BlendingJob::Layer two[2];
-      two[0].transform = ozz::span<const ozz::math::SoaTransform>(inst->accum, inst->num_soa);
+      two[0].transform =
+          ozz::span<const ozz::math::SoaTransform>(inst->accum,
+                                                    inst->num_soa);
       two[0].weight = sum_normal;
-      two[1].transform = ozz::span<const ozz::math::SoaTransform>(ws->temp, inst->num_soa);
+      two[1].transform =
+          ozz::span<const ozz::math::SoaTransform>(ws->temp,
+                                                    inst->num_soa);
       two[1].weight = L.weight;
 
       ozz::animation::BlendingJob job;
-      job.threshold = 0.0f;
-      job.layers = ozz::span<const ozz::animation::BlendingJob::Layer>(two, 2);
-      job.additive_layers = ozz::span<const ozz::animation::BlendingJob::Layer>();
-      job.output = ozz::span<ozz::math::SoaTransform>(inst->accum, inst->num_soa);
+      job.threshold = 0.f;
+      job.layers =
+          ozz::span<const ozz::animation::BlendingJob::Layer>(two, 2);
+      job.additive_layers = {};
+      job.output =
+          ozz::span<ozz::math::SoaTransform>(inst->accum,
+                                             inst->num_soa);
 
-      if (!job.Run()) return set_err(OZZ_ERR_OZZ, "blend failed");
+      if (!job.Run())
+        return set_err(OZZ_ERR_OZZ, "blend failed");
       sum_normal += L.weight;
     }
   }
 
-  if (!have_normal) return set_err(OZZ_ERR_INVALID_ARGUMENT, "no normal layers with weight > 0");
+  if (!have_normal)
+    return set_err(OZZ_ERR_INVALID_ARGUMENT,
+                   "no normal layers");
 
-  // 2) apply additive layers one-by-one on top of accum
+  // 2) additive layers
   for (int32_t i = 0; i < inst->layer_count; ++i) {
     const ozz_layer_desc_t& L = inst->layers[i];
-    if (!L.anim || L.weight <= 0.0f) continue;
+    if (!L.anim || L.weight <= 0.f) continue;
     if (L.mode != OZZ_LAYER_ADDITIVE) continue;
 
-    ozz_result_t r = sample_into(inst, L.anim, L.time_seconds, L.wrap_time, ws->temp);
+    ozz_result_t r =
+        sample_into(inst, L.anim, L.time_seconds, L.wrap_time, ws->temp);
     if (r != OZZ_OK) return set_err(r, "sample failed");
 
     ozz::animation::BlendingJob::Layer base;
-    base.transform = ozz::span<const ozz::math::SoaTransform>(inst->accum, inst->num_soa);
-    base.weight = 1.0f;
+    base.transform =
+        ozz::span<const ozz::math::SoaTransform>(inst->accum,
+                                                  inst->num_soa);
+    base.weight = 1.f;
 
     ozz::animation::BlendingJob::Layer add;
-    add.transform = ozz::span<const ozz::math::SoaTransform>(ws->temp, inst->num_soa);
+    add.transform =
+        ozz::span<const ozz::math::SoaTransform>(ws->temp,
+                                                  inst->num_soa);
     add.weight = L.weight;
 
     ozz::animation::BlendingJob job;
-    job.threshold = 0.0f;
-    job.layers = ozz::span<const ozz::animation::BlendingJob::Layer>(&base, 1);
-    job.additive_layers = ozz::span<const ozz::animation::BlendingJob::Layer>(&add, 1);
-    job.output = ozz::span<ozz::math::SoaTransform>(inst->accum, inst->num_soa);
+    job.threshold = 0.f;
+    job.layers =
+        ozz::span<const ozz::animation::BlendingJob::Layer>(&base, 1);
+    job.additive_layers =
+        ozz::span<const ozz::animation::BlendingJob::Layer>(&add, 1);
+    job.output =
+        ozz::span<ozz::math::SoaTransform>(inst->accum,
+                                           inst->num_soa);
 
-    if (!job.Run()) return set_err(OZZ_ERR_OZZ, "additive blend failed");
+    if (!job.Run())
+      return set_err(OZZ_ERR_OZZ, "additive failed");
   }
 
-  // 3) IK: compute model, apply jobs (in-place on accum), recompute model
+  // 3) IK
   if (inst->ik_count > 0) {
-    ozz_result_t r = locals_to_model(inst, inst->accum, ws->model);
-    if (r != OZZ_OK) return set_err(r, "local->model pre-IK failed");
+    ozz_result_t r =
+        locals_to_model(inst, inst->accum, ws->model);
+    if (r != OZZ_OK)
+      return set_err(r, "ltm pre-IK failed");
 
     for (int32_t i = 0; i < inst->ik_count; ++i) {
       const ozz_ik_job_t& J = inst->ik[i];
-      if (J.kind == OZZ_IK_TWO_BONE) {
-        ozz::animation::IKTwoBoneJob job;
-        job.weight = J.weight;
-        job.joint = J.start_joint;
-        job.mid_joint = J.mid_joint;
-        job.end_joint = J.end_joint;
-        job.target = f3(J.target_ms);
-        job.pole_vector = f3(J.pole_ms);
+      if (J.weight <= 0.f) continue;
 
-        job.skeleton = inst->skel;
-        job.input = ozz::span<const ozz::math::SoaTransform>(inst->accum, inst->num_soa);
-        job.output = ozz::span<ozz::math::SoaTransform>(inst->accum, inst->num_soa);
-        job.model_space_matrices = ozz::span<const ozz::math::Float4x4>(ws->model, inst->num_joints);
+      if (J.kind == OZZ_IK_AIM) {
+        const int32_t j = J.aim_joint;
+        if (j < 0 || j >= inst->num_joints) continue;
 
-        if (!job.Run()) return set_err(OZZ_ERR_OZZ, "IKTwoBone failed");
-      } else if (J.kind == OZZ_IK_AIM) {
         ozz::animation::IKAimJob job;
+        job.joint = &ws->model[j];
+        job.target =
+            load3(J.aim_target_ms.x,
+                  J.aim_target_ms.y,
+                  J.aim_target_ms.z, 1.f);
+        job.forward =
+            load3(J.forward_axis_ls.x,
+                  J.forward_axis_ls.y,
+                  J.forward_axis_ls.z, 0.f);
+        job.up =
+            load3(J.up_axis_ls.x,
+                  J.up_axis_ls.y,
+                  J.up_axis_ls.z, 0.f);
+        job.offset = ozz::math::simd_float4::zero();
+        job.pole_vector =
+            ozz::math::simd_float4::zero();
         job.weight = J.weight;
-        job.joint = J.aim_joint;
-        job.target = f3(J.aim_target_ms);
-        job.forward = f3(J.forward_axis_ls);
-        job.up = f3(J.up_axis_ls);
 
-        job.skeleton = inst->skel;
-        job.input = ozz::span<const ozz::math::SoaTransform>(inst->accum, inst->num_soa);
-        job.output = ozz::span<ozz::math::SoaTransform>(inst->accum, inst->num_soa);
-        job.model_space_matrices = ozz::span<const ozz::math::Float4x4>(ws->model, inst->num_joints);
+        ozz::math::SimdQuaternion corr;
+        job.joint_correction = &corr;
 
-        if (!job.Run()) return set_err(OZZ_ERR_OZZ, "IKAim failed");
+        if (!job.Run())
+          return set_err(OZZ_ERR_OZZ, "IKAim failed");
+
+        apply_joint_rotation_correction(
+            j, corr, inst->accum, inst->num_soa);
+
+      } else if (J.kind == OZZ_IK_TWO_BONE) {
+        const int32_t s = J.start_joint;
+        const int32_t m = J.mid_joint;
+        const int32_t e = J.end_joint;
+        if (s < 0 || m < 0 || e < 0) continue;
+        if (s >= inst->num_joints ||
+            m >= inst->num_joints ||
+            e >= inst->num_joints) continue;
+
+        ozz::animation::IKTwoBoneJob job;
+        job.start_joint = &ws->model[s];
+        job.mid_joint   = &ws->model[m];
+        job.end_joint   = &ws->model[e];
+
+        job.target =
+            load3(J.target_ms.x,
+                  J.target_ms.y,
+                  J.target_ms.z, 1.f);
+        job.pole_vector =
+            load3(J.pole_ms.x,
+                  J.pole_ms.y,
+                  J.pole_ms.z, 0.f);
+        job.mid_axis =
+            ozz::math::simd_float4::z_axis();
+        job.weight = J.weight;
+        job.twist_angle = 0.f;
+        job.soften = 1.f;
+
+        ozz::math::SimdQuaternion sc, mc;
+        job.start_joint_correction = &sc;
+        job.mid_joint_correction   = &mc;
+
+        if (!job.Run())
+          return set_err(OZZ_ERR_OZZ,
+                         "IKTwoBone failed");
+
+        apply_joint_rotation_correction(
+            s, sc, inst->accum, inst->num_soa);
+        apply_joint_rotation_correction(
+            m, mc, inst->accum, inst->num_soa);
       }
     }
   }
 
-  // 4) final local->model + palette pack
+  // 4) final LTM + palette
   {
-    ozz_result_t r = locals_to_model(inst, inst->accum, ws->model);
-    if (r != OZZ_OK) return set_err(r, "local->model failed");
+    ozz_result_t r =
+        locals_to_model(inst, inst->accum, ws->model);
+    if (r != OZZ_OK)
+      return set_err(r, "ltm failed");
+
     for (int32_t i = 0; i < inst->num_joints; ++i) {
-      store_3x4_col_major(ws->model[i], ws->palette + (size_t)i * 12u);
+      store_3x4_col_major(ws->model[i],
+                          ws->palette + (size_t)i * 12u);
     }
   }
 
