@@ -1,3 +1,4 @@
+
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -17,126 +18,81 @@ typedef enum ozz_result_t {
 const char* ozz_last_error(void);
 void ozz_clear_error(void);
 
-// Loaded runtime data
 typedef struct ozz_skeleton_t ozz_skeleton_t;
 typedef struct ozz_animation_t ozz_animation_t;
 
-// Persistent evaluation instance: contains SamplingJob::Context and (optionally) a default output locals buffer.
-// The instance itself is stored inside caller-provided memory.
-typedef struct ozz_anim_instance_t ozz_anim_instance_t;
+typedef struct ozz_instance_t ozz_instance_t;   // per-entity persistent state
+typedef struct ozz_workspace_t ozz_workspace_t; // per-worker scratch/output
 
-// ---------- Loading ----------
+enum { OZZ_MAX_LAYERS = 8 };
+enum { OZZ_MAX_IK_JOBS = 8 };
+
+typedef enum ozz_layer_mode_t {
+  OZZ_LAYER_NORMAL = 0,
+  OZZ_LAYER_ADDITIVE = 1,
+} ozz_layer_mode_t;
+
+typedef struct ozz_layer_desc_t {
+  const ozz_animation_t* anim;
+  float time_seconds;
+  int wrap_time; // 0 clamp, !=0 wrap
+  float weight;
+  ozz_layer_mode_t mode;
+} ozz_layer_desc_t;
+
+typedef struct ozz_vec3_t { float x, y, z; } ozz_vec3_t;
+
+typedef enum ozz_ik_kind_t {
+  OZZ_IK_NONE = 0,
+  OZZ_IK_TWO_BONE = 1,
+  OZZ_IK_AIM = 2,
+} ozz_ik_kind_t;
+
+typedef struct ozz_ik_job_t {
+  ozz_ik_kind_t kind;
+  float weight;
+
+  // TWO_BONE
+  int32_t start_joint;
+  int32_t mid_joint;
+  int32_t end_joint;
+  ozz_vec3_t target_ms;
+  ozz_vec3_t pole_ms;
+
+  // AIM
+  int32_t aim_joint;
+  ozz_vec3_t aim_target_ms;
+  ozz_vec3_t forward_axis_ls;
+  ozz_vec3_t up_axis_ls;
+} ozz_ik_job_t;
+
+// Loading
 ozz_result_t ozz_skeleton_load_from_file(const char* path, ozz_skeleton_t** out_skel);
 ozz_result_t ozz_animation_load_from_file(const char* path, ozz_animation_t** out_anim);
 void ozz_skeleton_destroy(ozz_skeleton_t* skel);
 void ozz_animation_destroy(ozz_animation_t* anim);
 
-// ---------- Introspection ----------
 int32_t ozz_skeleton_num_joints(const ozz_skeleton_t* skel);
-int32_t ozz_animation_num_tracks(const ozz_animation_t* anim);
 float   ozz_animation_duration(const ozz_animation_t* anim);
 
-// ---------- Scratch sizing ----------
-// Ozz SoA local transforms buffer size/alignment (SoaTransform[(num_joints+3)/4])
-size_t ozz_soa_locals_bytes(const ozz_skeleton_t* skel);
-size_t ozz_soa_locals_align(void);
+// Instance (persistent, per entity)
+size_t ozz_instance_required_bytes(const ozz_skeleton_t* skel);
+ozz_result_t ozz_instance_init(void* mem, size_t mem_bytes, const ozz_skeleton_t* skel, ozz_instance_t** out_inst);
 
-// Model scratch buffer size/alignment (Float4x4[num_joints])
-size_t ozz_model_scratch_bytes(const ozz_skeleton_t* skel);
-size_t ozz_model_scratch_align(void);
+void ozz_instance_set_layers(ozz_instance_t* inst, const ozz_layer_desc_t* layers, int32_t count);
+void ozz_instance_set_ik_jobs(ozz_instance_t* inst, const ozz_ik_job_t* jobs, int32_t count);
 
-// ---------- Instance memory sizing/init ----------
-// Instance memory includes only the instance struct + SamplingJob::Context + (optionally) one SoA output locals buffer.
-//
-// If you prefer total control, you can set include_output_locals=0 and always provide out_locals_soa buffers yourself.
-size_t ozz_anim_instance_required_bytes(const ozz_skeleton_t* skel, int include_output_locals);
+// Workspace (scratch/output, per worker thread or per batch)
+size_t ozz_workspace_required_bytes(const ozz_skeleton_t* skel);
+ozz_result_t ozz_workspace_init(void* mem, size_t mem_bytes, const ozz_skeleton_t* skel, ozz_workspace_t** out_ws);
 
-// `mem` must be at least required_bytes, with reasonable alignment (16 is fine).
-ozz_result_t ozz_anim_instance_init(
-  void* mem, size_t mem_bytes,
-  const ozz_skeleton_t* skel,
-  int include_output_locals,
-  ozz_anim_instance_t** out_inst
-);
+// Evaluate: writes palette into workspace
+// Palette format: float[12*num_joints], column-major 3x4 per joint.
+ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws);
 
-// If include_output_locals!=0, you can get the built-in output locals SoA buffer from the instance.
-ozz_result_t ozz_anim_instance_get_output_locals(
-  ozz_anim_instance_t* inst,
-  void** out_locals_soa,
-  size_t* out_bytes
-);
-
-// ---------- Time handling ----------
-// If wrap_time != 0, time wraps into [0, duration). Else clamps [0, duration].
-float ozz_normalize_time(const ozz_animation_t* anim, float time_seconds, int wrap_time);
-
-// ---------- Sampling ----------
-// Samples one animation into a caller-provided SoA locals buffer.
-ozz_result_t ozz_sample_locals_soa(
-  ozz_anim_instance_t* inst,
-  const ozz_animation_t* anim,
-  float normalized_time_seconds, // you usually pass ozz_normalize_time(...)
-  void* out_locals_soa,
-  size_t out_locals_bytes
-);
-
-// ---------- Blending ----------
-// A simple blend stack: N layers blended additively or normally into out_locals_soa.
-//
-// This is a “generic enough” primitive: you can build walk/jog/run (N=3) and later layer upper-body (additive).
-typedef enum ozz_blend_mode_t {
-  OZZ_BLEND_NORMAL = 0,
-  OZZ_BLEND_ADDITIVE = 1
-} ozz_blend_mode_t;
-
-typedef struct ozz_blend_layer_t {
-  const void* locals_soa;     // sampled locals SoA
-  float weight;               // 0..1
-  ozz_blend_mode_t mode;      // normal or additive
-} ozz_blend_layer_t;
-
-// Blends layers into out_locals_soa (SoA).
-ozz_result_t ozz_blend_locals_soa(
-  ozz_anim_instance_t* inst,
-  const ozz_blend_layer_t* layers,
-  int32_t layer_count,
-  void* out_locals_soa,
-  size_t out_locals_bytes
-);
-
-// ---------- Local->Model + pack to 3x4 ----------
-// out_3x4_col_major is float[12 * num_joints]. Format described below.
-ozz_result_t ozz_locals_to_model_3x4(
-  ozz_anim_instance_t* inst,
-  const void* locals_soa,
-  size_t locals_bytes,
-  void* model_scratch,          // Float4x4[num_joints] scratch (caller-owned)
-  size_t model_scratch_bytes,
-  float* out_3x4_col_major      // 12 * num_joints floats
-);
-
-// Convenience: sample N clips, blend, and output 3x4 in one call.
-// You provide sampled_locals_soa[i] buffers for each layer (caller-owned).
-typedef struct ozz_eval_layer_t {
-  const ozz_animation_t* anim;
-  float time_seconds;     // unnormalized
-  int wrap_time;          // normalize per-layer
-  float weight;
-  ozz_blend_mode_t mode;
-  void* sampled_locals_soa;
-  size_t sampled_locals_bytes;
-} ozz_eval_layer_t;
-
-ozz_result_t ozz_eval_blend_model_3x4(
-  ozz_anim_instance_t* inst,
-  const ozz_eval_layer_t* layers,
-  int32_t layer_count,
-  void* out_locals_soa,          // can be instance output or caller buffer
-  size_t out_locals_bytes,
-  void* model_scratch,
-  size_t model_scratch_bytes,
-  float* out_3x4_col_major
-);
+// Access palette from workspace (valid until next eval on that workspace)
+const float* ozz_workspace_palette_3x4(const ozz_workspace_t* ws);
+int32_t      ozz_workspace_palette_floats(const ozz_workspace_t* ws); // = 12*num_joints
 
 #ifdef __cplusplus
 } // extern "C"
