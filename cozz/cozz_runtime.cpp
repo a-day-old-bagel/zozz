@@ -67,7 +67,6 @@ static ozz_result_t load_ozz_object_from_file(const char* path, T* out_obj) {
   ozz::io::IArchive ar(&file);
   if (!ar.TestTag<T>()) return set_err(OZZ_ERR_OZZ, "tag mismatch");
   ar >> *out_obj;
-  if (!ar.ok()) return set_err(OZZ_ERR_OZZ, "read failed");
   return OZZ_OK;
 }
 

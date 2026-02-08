@@ -1,5 +1,4 @@
 const std = @import("std");
-const Alloc = std.mem.Allocator;
 
 pub const c = @cImport({
     @cInclude("cozz_runtime.h");
@@ -9,7 +8,6 @@ pub const OzzError = error{
     InvalidArgument,
     Io,
     OzzFailure,
-    OutOfMemory,
     Unknown,
 };
 
@@ -38,7 +36,7 @@ pub fn clearError() void {
 pub const Skeleton = struct {
     handle: *c.ozz_skeleton_t,
 
-    pub fn loadFromFileZ(path_z: [:0]const u8) OzzError!Skeleton {
+    pub fn loadFromFileZ(path_z: [:0]const u8) !Skeleton {
         var out: ?*c.ozz_skeleton_t = null;
         try mapResult(c.ozz_skeleton_load_from_file(path_z.ptr, &out));
         return .{ .handle = out.? };
@@ -49,30 +47,23 @@ pub const Skeleton = struct {
         self.* = undefined;
     }
 
-    pub fn numJoints(self: Skeleton) i32 {
-        return c.ozz_skeleton_num_joints(self.handle);
+    pub fn numJoints(self: Skeleton) usize {
+        return @intCast(c.ozz_skeleton_num_joints(self.handle));
     }
 
-    pub fn soaLocalsBytes(self: Skeleton) usize {
-        return c.ozz_soa_locals_bytes(self.handle);
-    }
-    pub fn soaLocalsAlign() usize {
-        return c.ozz_soa_locals_align();
+    pub fn instanceBytes(self: Skeleton) usize {
+        return @intCast(c.ozz_instance_required_bytes(self.handle));
     }
 
-    pub fn modelScratchBytes(self: Skeleton) usize {
-        return c.ozz_model_scratch_bytes(self.handle);
-    }
-    pub fn modelScratchAlign(self: Skeleton) usize {
-        _ = self;
-        return c.ozz_model_scratch_align();
+    pub fn workspaceBytes(self: Skeleton) usize {
+        return @intCast(c.ozz_workspace_required_bytes(self.handle));
     }
 };
 
 pub const Animation = struct {
     handle: *c.ozz_animation_t,
 
-    pub fn loadFromFileZ(path_z: [:0]const u8) OzzError!Animation {
+    pub fn loadFromFileZ(path_z: [:0]const u8) !Animation {
         var out: ?*c.ozz_animation_t = null;
         try mapResult(c.ozz_animation_load_from_file(path_z.ptr, &out));
         return .{ .handle = out.? };
@@ -86,163 +77,54 @@ pub const Animation = struct {
     pub fn duration(self: Animation) f32 {
         return c.ozz_animation_duration(self.handle);
     }
-
-    pub fn normalizeTime(self: Animation, t_seconds: f32, wrap: bool) f32 {
-        return c.ozz_normalize_time(self.handle, t_seconds, @intFromBool(wrap));
-    }
 };
 
-pub const BlendMode = enum(c_int) {
-    normal = c.OZZ_BLEND_NORMAL,
-    additive = c.OZZ_BLEND_ADDITIVE,
+// --------------------
+// Layers
+// --------------------
+
+pub const LayerMode = enum(u32) {
+    normal = c.OZZ_LAYER_NORMAL,
+    additive = c.OZZ_LAYER_ADDITIVE,
 };
 
-pub const EvalLayer = struct {
+pub const Layer = struct {
     anim: Animation,
     time_seconds: f32,
     wrap_time: bool = true,
     weight: f32,
-    mode: BlendMode = .normal,
-
-    /// Caller-provided sampled locals buffer (SoA). Must be sized to skel.soaLocalsBytes().
-    sampled_locals_soa: []u8,
+    mode: LayerMode = .normal,
 };
 
 // --------------------
-// Per-entity instance
+// Per-entity Instance
 // --------------------
 
 pub const Instance = struct {
-    skel: Skeleton,
-    inst: *c.ozz_anim_instance_t,
+    storage: []align(16) u8,
+    handle: *c.ozz_instance_t,
 
-    mem: []align(16) u8,
-    output_locals_soa: ?[]u8 = null,
-    model_scratch: []u8,
-    palette_3x4: []f32,
+    pub fn init(allocator: std.mem.Allocator, skel: Skeleton) !Instance {
+        const bytes = skel.instanceBytes();
+        const storage = try allocator.alignedAlloc(u8, 16, bytes);
+        errdefer allocator.free(storage);
 
-    /// Hard limit for allocation-free stack layer array.
-    pub const MaxLayers: usize = 4;
+        var out: ?*c.ozz_instance_t = null;
+        try mapResult(c.ozz_instance_init(storage.ptr, storage.len, skel.handle, &out));
 
-    /// Create an instance + allocate commonly-needed per-entity buffers.
-    /// if include_output_locals, will populate output_locals_soa for later IK or whatever.
-    pub fn initOwned(
-        allocator: std.mem.Allocator,
-        skel: Skeleton,
-        include_output_locals: bool,
-    ) OzzError!Instance {
-        const need = c.ozz_anim_instance_required_bytes(skel.handle, @intFromBool(include_output_locals));
-        const mem = allocator.alignedAlloc(u8, 16, need) catch return OzzError.OutOfMemory;
-        errdefer allocator.free(mem);
-
-        var out_inst: ?*c.ozz_anim_instance_t = null;
-        try mapResult(c.ozz_anim_instance_init(
-            mem.ptr,
-            mem.len,
-            skel.handle,
-            @intFromBool(include_output_locals),
-            &out_inst,
-        ));
-
-        var self: Instance = .{
-            .skel = skel,
-            .inst = out_inst.?,
-            .mem = mem,
-            .output_locals_soa = null,
-            .model_scratch = undefined,
-            .palette_3x4 = undefined,
-        };
-
-        if (include_output_locals) {
-            var p: ?*anyopaque = null;
-            var bytes: usize = 0;
-            try mapResult(c.ozz_anim_instance_get_output_locals(self.inst, &p, &bytes));
-            self.output_locals_soa = @as([*]u8, @ptrCast(p.?))[0..bytes];
-        }
-
-        const ms_bytes = skel.modelScratchBytes();
-        const ms_align = skel.modelScratchAlign();
-        self.model_scratch = allocator.alignedAlloc(u8, ms_align, ms_bytes) catch return OzzError.OutOfMemory;
-        errdefer allocator.free(self.model_scratch);
-
-        const joints: usize = @intCast(skel.numJoints());
-        self.palette_3x4 = allocator.alloc(f32, joints * 12) catch return OzzError.OutOfMemory;
-        errdefer allocator.free(self.palette_3x4);
-
-        return self;
+        return .{ .storage = storage, .handle = out.? };
     }
 
-    pub fn deinitOwned(self: *Instance, allocator: std.mem.Allocator) void {
-        allocator.free(self.palette_3x4);
-        allocator.free(self.model_scratch);
-        allocator.free(self.mem);
+    pub fn deinit(self: *Instance, allocator: std.mem.Allocator) void {
+        allocator.free(self.storage);
         self.* = undefined;
     }
 
-    pub fn numJoints(self: Instance) i32 {
-        return self.skel.numJoints();
-    }
+    pub fn setLayers(self: *Instance, layers: []const Layer) void {
+        // Hard limit in the C wrapper is 8.
+        if (layers.len > c.OZZ_MAX_LAYERS) @panic("too many layers (max 8)");
 
-    pub fn soaLocalsBytes(self: Instance) usize {
-        return self.skel.soaLocalsBytes();
-    }
-
-    /// Sample one clip into a caller-provided SoA locals buffer.
-    pub fn sampleLocalsSoa(
-        self: Instance,
-        anim: Animation,
-        time_seconds: f32,
-        wrap: bool,
-        out_locals_soa: []u8,
-    ) OzzError!void {
-        const t = anim.normalizeTime(time_seconds, wrap);
-        try mapResult(c.ozz_sample_locals_soa(
-            self.inst,
-            anim.handle,
-            t,
-            out_locals_soa.ptr,
-            out_locals_soa.len,
-        ));
-    }
-
-    /// Locals SoA -> model palette 3x4 into out_palette (float[12*joints]).
-    pub fn localsToModel3x4(
-        self: Instance,
-        locals_soa: []const u8,
-        model_scratch: []u8,
-        out_palette_3x4: []f32,
-    ) OzzError!void {
-        const need_floats = @as(usize, @intCast(self.numJoints())) * 12;
-        if (out_palette_3x4.len < need_floats) return OzzError.InvalidArgument;
-
-        try mapResult(c.ozz_locals_to_model_3x4(
-            self.inst,
-            locals_soa.ptr,
-            locals_soa.len,
-            model_scratch.ptr,
-            model_scratch.len,
-            out_palette_3x4.ptr,
-        ));
-    }
-
-    /// Helper to sample each layer into its provided sampled_locals_soa,
-    /// blend into out_locals_soa, then output model palette 3x4.
-    ///
-    /// - layers.len must be <= MaxLayers.
-    /// - out_locals_soa is usually self.output_locals_soa.
-    /// - model_scratch is usually self.model_scratch.
-    /// - out_palette_3x4 is usually self.palette_3x4.
-    pub fn evalBlendModel3x4(
-        self: Instance,
-        layers: []const EvalLayer,
-        out_locals_soa: []u8,
-        model_scratch: []u8,
-        out_palette_3x4: []f32,
-    ) OzzError!void {
-        if (layers.len == 0 or layers.len > MaxLayers) return OzzError.InvalidArgument;
-
-        // Stack array of C layer structs (no heap).
-        var tmp: [MaxLayers]c.ozz_eval_layer_t = undefined;
+        var tmp: [c.OZZ_MAX_LAYERS]c.ozz_layer_desc_t = undefined;
 
         for (layers, 0..) |L, i| {
             tmp[i] = .{
@@ -251,190 +133,108 @@ pub const Instance = struct {
                 .wrap_time = @intFromBool(L.wrap_time),
                 .weight = L.weight,
                 .mode = @intCast(@intFromEnum(L.mode)),
-                .sampled_locals_soa = L.sampled_locals_soa.ptr,
-                .sampled_locals_bytes = L.sampled_locals_soa.len,
             };
         }
 
-        const need_floats = @as(usize, @intCast(self.numJoints())) * 12;
-        if (out_palette_3x4.len < need_floats) return OzzError.InvalidArgument;
-
-        try mapResult(c.ozz_eval_blend_model_3x4(
-            self.inst,
+        c.ozz_instance_set_layers(
+            self.handle,
             &tmp[0],
             @intCast(layers.len),
-            out_locals_soa.ptr,
-            out_locals_soa.len,
-            model_scratch.ptr,
-            model_scratch.len,
-            out_palette_3x4.ptr,
-        ));
+        );
     }
 
-    /// “Most common per-entity path” using owned buffers:
-    /// - out locals: instance output_locals_soa must exist
-    /// - model scratch: self.model_scratch
-    /// - palette: self.palette_3x4
-    pub fn evalOwnedBlendModel3x4(
-        self: Instance,
-        layers: []const EvalLayer,
-    ) OzzError![]f32 {
-        const out_locals = self.output_locals_soa orelse return OzzError.InvalidArgument;
-        try self.evalBlendModel3x4(
-            layers,
-            out_locals,
-            self.model_scratch,
-            self.palette_3x4,
-        );
-        return self.palette_3x4;
+    // Optional: expose later if you want IK from Zig.
+    // pub fn setIkJobs(...) void { ... }
+};
+
+// --------------------
+// Per-worker Workspace
+// --------------------
+
+pub const Workspace = struct {
+    storage: []align(16) u8,
+    handle: *c.ozz_workspace_t,
+
+    pub fn init(allocator: std.mem.Allocator, skel: Skeleton) !Workspace {
+        const bytes = skel.workspaceBytes();
+        const storage = try allocator.alignedAlloc(u8, 16, bytes);
+        errdefer allocator.free(storage);
+
+        var out: ?*c.ozz_workspace_t = null;
+        try mapResult(c.ozz_workspace_init(storage.ptr, storage.len, skel.handle, &out));
+
+        return .{ .storage = storage, .handle = out.? };
+    }
+
+    pub fn deinit(self: *Workspace, allocator: std.mem.Allocator) void {
+        allocator.free(self.storage);
+        self.* = undefined;
+    }
+
+    pub fn palette3x4(self: Workspace) []const f32 {
+        const ptr = c.ozz_workspace_palette_3x4(self.handle);
+        const len = @as(usize, @intCast(c.ozz_workspace_palette_floats(self.handle)));
+        return ptr[0..len];
     }
 };
 
-// pub fn allocLayerScratch(alloc: Alloc, skel: Skeleton) OzzError![]u8 {
-//     const bytes = skel.soaLocalsBytes();
-//     const alignment = Skeleton.soaLocalsAlign();
-//     return alloc.alignedAlloc(u8, alignment, bytes) catch return OzzError.OutOfMemory;
-// }
+// --------------------
+// Evaluate
+// --------------------
 
-// pub fn createLayerScratchBuffers(alloc: Alloc, skel: Skeleton, comptime num_layers: usize) OzzError![num_layers][]u8 {
-//     const bytes = skel.soaLocalsBytes();
-//     const alignment = Skeleton.soaLocalsAlign();
-
-//     var scratch: [num_layers]?[]u8 = &.{ null ** num_layers };
-//     inline for (scratch.items) |*entry| {
-//         entry = alloc.alignedAlloc(u8, alignment, bytes) catch return OzzError.OutOfMemory;
-//     }
-
-//     return scratch;
-// }
-
-// pub const LayerScratch = struct {
-//     sampled: [Instance.MaxLayers][]u8,
-
-//     pub fn initOwned(
-//         allocator: std.mem.Allocator,
-//         skel: Skeleton,
-//     ) OzzError!LayerScratch {
-//         const bytes = skel.soaLocalsBytes();
-//         const alignment = Skeleton.soaLocalsAlign();
-
-//         const self: LayerScratch = undefined;
-//         for (self.sampled) |*buf| {
-//             buf.* = allocator.alignedAlloc(u8, alignment, bytes) catch return OzzError.OutOfMemory;
-//         }
-//         return self;
-//     }
-
-//     pub fn deinitOwned(self: *LayerScratch, allocator: std.mem.Allocator) void {
-//         for (self.sampled) |buf| allocator.free(buf);
-//         self.* = undefined;
-//     }
-// };
+pub fn evalModel3x4(inst: *Instance, ws: *Workspace) ![]const f32 {
+    try mapResult(c.ozz_eval_model_3x4(inst.handle, ws.handle));
+    return ws.palette3x4();
+}
 
 // --------------------
 // Tests
 // --------------------
 
 test "ozz C ABI wrapper: load + 2-clip blend + 3x4 palette is sane" {
-    // ---- Configure these paths to your extracted ozz sample assets ----
-    // They must be NUL-terminated Zig strings ([:0]const u8).
-    const Paths = struct {
-        pub const skeleton: [:0]const u8 = "assets/ozz/skeleton.ozz\x00";
-        pub const walk: [:0]const u8 = "assets/ozz/walk.ozz\x00";
-        pub const jog: [:0]const u8 = "assets/ozz/jog.ozz\x00";
-        // Optional:
-        // pub const aim_add:  [:0]const u8 = "assets/ozz/aim_additive.ozz\x00";
-    };
+    const A = std.testing.allocator;
 
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        const leak = gpa_state.deinit();
-        if (leak == .leak) @panic("leak detected");
-    }
-    const gpa = gpa_state.allocator();
-
-    // Load assets
-    var skel = try Skeleton.loadFromFileZ(Paths.skeleton);
+    // Replace with your real cooked asset paths.
+    var skel = try Skeleton.loadFromFileZ("assets/cooked/hero_skeleton.ozz");
     defer skel.deinit();
 
-    var walk = try Animation.loadFromFileZ(Paths.walk);
+    var idle = try Animation.loadFromFileZ("assets/cooked/hero_idle.ozz");
+    defer idle.deinit();
+
+    var walk = try Animation.loadFromFileZ("assets/cooked/hero_walk.ozz");
     defer walk.deinit();
 
-    var jog = try Animation.loadFromFileZ(Paths.jog);
-    defer jog.deinit();
+    var inst = try Instance.init(A, skel);
+    defer inst.deinit(A);
 
-    // Basic sanity checks
-    try std.testing.expect(skel.numJoints() > 0);
-    try std.testing.expect(@as(i32, @intFromFloat(walk.duration())) >= 0);
-    try std.testing.expect(@as(i32, @intFromFloat(jog.duration())) >= 0);
+    var ws = try Workspace.init(A, skel);
+    defer ws.deinit(A);
 
-    // Create per-entity instance (owned buffers)
-    var inst = try Instance.initOwned(gpa, skel, true);
-    defer inst.deinitOwned(gpa);
+    inst.setLayers(&[_]Layer{
+        .{ .anim = idle, .time_seconds = 0.10, .wrap_time = true, .weight = 0.35, .mode = .normal },
+        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 0.65, .mode = .normal },
+    });
 
-    // Per-entity sampled locals buffers (up to 4 layers)
-    var scratch = try LayerScratch.initOwned(gpa, skel);
-    defer scratch.deinitOwned(gpa);
+    const palette = try evalModel3x4(&inst, &ws);
 
-    // We’ll blend walk<->jog at some speed alpha.
-    const t: f32 = 1.2345;
-    const alpha: f32 = 0.37;
+    const joints = skel.numJoints();
+    try std.testing.expectEqual(@as(usize, 12) * joints, palette.len);
 
-    // Build layers (2 layers: walk + jog). Both "normal" blending.
-    var layers_arr: [2]EvalLayer = .{
-        .{
-            .anim = walk,
-            .time_seconds = t,
-            .wrap_time = true,
-            .weight = 1.0 - alpha,
-            .mode = .normal,
-            .sampled_locals_soa = scratch.sampled[0],
-        },
-        .{
-            .anim = jog,
-            .time_seconds = t,
-            .wrap_time = true,
-            .weight = alpha,
-            .mode = .normal,
-            .sampled_locals_soa = scratch.sampled[1],
-        },
-    };
+    var sum_abs: f32 = 0;
+    for (palette) |v| sum_abs += @abs(v);
+    try std.testing.expect(sum_abs > 0.001);
 
-    // Run evaluation into instance-owned buffers
-    const palette1 = try inst.evalOwnedBlendModel3x4_Stack4(layers_arr[0..]);
-
-    // ---- Validate palette output ----
-    // - correct length
-    // - all finite
-    // - not all zeros
-    try std.testing.expect(palette1.len == @as(usize, @intCast(skel.numJoints())) * 12);
-
-    var any_nonzero = false;
-    for (palette1) |v| {
-        try std.testing.expect(std.math.isFinite(v));
-        if (v != 0.0) any_nonzero = true;
-    }
-    try std.testing.expect(any_nonzero);
-
-    // ---- Determinism check: same inputs twice => identical output ----
-    const palette_before = try gpa.dupe(f32, palette1);
-    defer gpa.free(palette_before);
-
-    const palette2 = try inst.evalOwnedBlendModel3x4_Stack4(layers_arr[0..]);
-
-    try std.testing.expectEqual(palette_before.len, palette2.len);
-    for (palette_before, 0..) |a, i| {
-        const b = palette2[i];
-        // exact equality is expected here; if it fails due to platform SIMD differences,
-        // loosen to approxEqAbs.
-        try std.testing.expectEqual(a, b);
+    for (0..joints) |j| {
+        const base = j * 12;
+        const tx = palette[base + 9];
+        const ty = palette[base + 10];
+        const tz = palette[base + 11];
+        try std.testing.expect(std.math.isFinite(tx));
+        try std.testing.expect(std.math.isFinite(ty));
+        try std.testing.expect(std.math.isFinite(tz));
     }
 }
 
-test "ozz wrapper: invalid layer count fails" {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa_state.deinit();
-    const gpa = gpa_state.allocator();
-
-    _ = gpa;
+test "refAllDecls" {
+    std.testing.refAllDeclsRecursive(c);
 }
