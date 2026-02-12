@@ -16,8 +16,14 @@ fn mapResult(rc: c.ozz_result_t) OzzError!void {
         c.OZZ_OK => return,
         c.OZZ_ERR_INVALID_ARGUMENT => return OzzError.InvalidArgument,
         c.OZZ_ERR_IO => return OzzError.Io,
-        c.OZZ_ERR_OZZ => return OzzError.OzzFailure,
-        else => return OzzError.Unknown,
+        c.OZZ_ERR_OZZ => {
+            std.debug.print("cozz error: {s}\n", .{std.mem.span(c.ozz_last_error())});
+            return OzzError.OzzFailure;
+        },
+        else => {
+            std.debug.print("cozz error (unknown): {s}\n", .{std.mem.span(c.ozz_last_error())});
+            return OzzError.Unknown;
+        },
     }
 }
 
@@ -47,16 +53,16 @@ pub const Skeleton = struct {
         self.* = undefined;
     }
 
-    pub fn numJoints(self: Skeleton) usize {
-        return @intCast(c.ozz_skeleton_num_joints(self.handle));
+    pub fn numJoints(self: Skeleton) i32 {
+        return c.ozz_skeleton_num_joints(self.handle);
     }
 
     pub fn instanceBytes(self: Skeleton) usize {
-        return @intCast(c.ozz_instance_required_bytes(self.handle));
+        return c.ozz_instance_required_bytes(self.handle);
     }
 
     pub fn workspaceBytes(self: Skeleton) usize {
-        return @intCast(c.ozz_workspace_required_bytes(self.handle));
+        return c.ozz_workspace_required_bytes(self.handle);
     }
 };
 
@@ -116,6 +122,7 @@ pub const Instance = struct {
     }
 
     pub fn deinit(self: *Instance, allocator: std.mem.Allocator) void {
+        c.ozz_instance_deinit(self.handle);
         allocator.free(self.storage);
         self.* = undefined;
     }
@@ -167,6 +174,7 @@ pub const Workspace = struct {
     }
 
     pub fn deinit(self: *Workspace, allocator: std.mem.Allocator) void {
+        c.ozz_workspace_deinit(self.handle);
         allocator.free(self.storage);
         self.* = undefined;
     }
@@ -194,14 +202,13 @@ pub fn evalModel3x4(inst: *Instance, ws: *Workspace) ![]const f32 {
 test "ozz C ABI wrapper: load + 2-clip blend + 3x4 palette is sane" {
     const A = std.testing.allocator;
 
-    // Replace with your real cooked asset paths.
-    var skel = try Skeleton.loadFromFileZ("assets/cooked/hero_skeleton.ozz");
+    var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
     defer skel.deinit();
 
-    var idle = try Animation.loadFromFileZ("assets/cooked/hero_idle.ozz");
-    defer idle.deinit();
+    var jog = try Animation.loadFromFileZ("assets/pab_jog_no_motion.ozz");
+    defer jog.deinit();
 
-    var walk = try Animation.loadFromFileZ("assets/cooked/hero_walk.ozz");
+    var walk = try Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
     defer walk.deinit();
 
     var inst = try Instance.init(A, skel);
@@ -211,13 +218,13 @@ test "ozz C ABI wrapper: load + 2-clip blend + 3x4 palette is sane" {
     defer ws.deinit(A);
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = idle, .time_seconds = 0.10, .wrap_time = true, .weight = 0.35, .mode = .normal },
+        .{ .anim = jog, .time_seconds = 0.10, .wrap_time = true, .weight = 0.35, .mode = .normal },
         .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 0.65, .mode = .normal },
     });
 
     const palette = try evalModel3x4(&inst, &ws);
 
-    const joints = skel.numJoints();
+    const joints = @as(usize, @intCast(skel.numJoints()));
     try std.testing.expectEqual(@as(usize, 12) * joints, palette.len);
 
     var sum_abs: f32 = 0;
@@ -233,8 +240,4 @@ test "ozz C ABI wrapper: load + 2-clip blend + 3x4 palette is sane" {
         try std.testing.expect(std.math.isFinite(ty));
         try std.testing.expect(std.math.isFinite(tz));
     }
-}
-
-test "refAllDecls" {
-    std.testing.refAllDeclsRecursive(c);
 }

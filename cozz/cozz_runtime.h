@@ -79,6 +79,7 @@ float   ozz_animation_duration(const ozz_animation_t* anim);
 // Instance (persistent, per entity)
 size_t ozz_instance_required_bytes(const ozz_skeleton_t* skel);
 ozz_result_t ozz_instance_init(void* mem, size_t mem_bytes, const ozz_skeleton_t* skel, ozz_instance_t** out_inst);
+void ozz_instance_deinit(ozz_instance_t* inst);
 
 void ozz_instance_set_layers(ozz_instance_t* inst, const ozz_layer_desc_t* layers, int32_t count);
 void ozz_instance_set_ik_jobs(ozz_instance_t* inst, const ozz_ik_job_t* jobs, int32_t count);
@@ -86,6 +87,7 @@ void ozz_instance_set_ik_jobs(ozz_instance_t* inst, const ozz_ik_job_t* jobs, in
 // Workspace (scratch/output, per worker thread or per batch)
 size_t ozz_workspace_required_bytes(const ozz_skeleton_t* skel);
 ozz_result_t ozz_workspace_init(void* mem, size_t mem_bytes, const ozz_skeleton_t* skel, ozz_workspace_t** out_ws);
+void ozz_workspace_deinit(ozz_workspace_t* ws);
 
 // Evaluate: writes palette into workspace
 // Palette format: float[12*num_joints], column-major 3x4 per joint.

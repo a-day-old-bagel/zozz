@@ -168,6 +168,11 @@ ozz_result_t ozz_instance_init(void* mem, size_t mem_bytes, const ozz_skeleton_t
   return OZZ_OK;
 }
 
+void ozz_instance_deinit(ozz_instance_t* inst) {
+  if (!inst) return;
+  inst->~ozz_instance_t(); // frees SamplingJob::Context internal allocations
+}
+
 void ozz_instance_set_layers(ozz_instance_t* inst, const ozz_layer_desc_t* layers, int32_t count) {
   if (!inst) return;
   if (!layers || count <= 0) { inst->layer_count = 0; return; }
@@ -225,6 +230,11 @@ ozz_result_t ozz_workspace_init(void* mem, size_t mem_bytes, const ozz_skeleton_
 
   *out_ws = ws;
   return OZZ_OK;
+}
+
+void ozz_workspace_deinit(ozz_workspace_t* ws) {
+  if (!ws) return;
+  ws->~ozz_workspace_t(); // currently trivial, but correct
 }
 
 const float* ozz_workspace_palette_3x4(const ozz_workspace_t* ws) { return ws ? ws->palette : nullptr; }
