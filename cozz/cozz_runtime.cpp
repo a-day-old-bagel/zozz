@@ -15,6 +15,7 @@
 #include "ozz/animation/runtime/local_to_model_job.h"
 #include "ozz/animation/runtime/ik_two_bone_job.h"
 #include "ozz/animation/runtime/ik_aim_job.h"
+#include "ozz/animation/runtime/skeleton_utils.h"
 
 #include "ozz/base/io/archive.h"
 #include "ozz/base/io/stream.h"
@@ -98,6 +99,15 @@ void ozz_animation_destroy(ozz_animation_t* anim) { delete anim; }
 
 int32_t ozz_skeleton_num_joints(const ozz_skeleton_t* skel) {
   return skel ? (int32_t)skel->skel.num_joints() : 0;
+}
+int32_t ozz_skeleton_find_joint(const ozz_skeleton_t* skel, const char* name) {
+  return (skel && name) ? (int32_t)ozz::animation::FindJoint(skel->skel, name) : -1;
+}
+const char* ozz_skeleton_joint_name(const ozz_skeleton_t* skel, int32_t joint) {
+  if (!skel) return nullptr;
+  const auto names = skel->skel.joint_names();
+  if (joint < 0 || joint >= (int32_t)names.size()) return nullptr;
+  return names[(size_t)joint];
 }
 float ozz_animation_duration(const ozz_animation_t* anim) {
   return anim ? anim->anim.duration() : 0.0f;
@@ -503,8 +513,6 @@ ozz_result_t ozz_eval_model_3x4_reference(ozz_instance_t* inst, ozz_workspace_t*
   if (inst->skel != ws->skel) return set_err(OZZ_ERR_INVALID_ARGUMENT, "skeleton mismatch");
   if (inst->num_joints != ws->num_joints) return set_err(OZZ_ERR_INVALID_ARGUMENT, "size mismatch");
   if (inst->layer_count <= 0) return set_err(OZZ_ERR_INVALID_ARGUMENT, "no layers");
-  if (inst->ik_count > 0) return set_err(OZZ_ERR_INVALID_ARGUMENT, "reference path does not support ik");
-
   std::vector<ozz::math::SoaTransform> sampled_normal;
   std::vector<ozz::math::SoaTransform> sampled_additive;
   std::vector<ozz::animation::BlendingJob::Layer> normal_layers;
@@ -557,6 +565,65 @@ ozz_result_t ozz_eval_model_3x4_reference(ozz_instance_t* inst, ozz_workspace_t*
 
   if (!blend_job.Validate()) return set_err(OZZ_ERR_OZZ, "reference blend validate failed");
   if (!blend_job.Run()) return set_err(OZZ_ERR_OZZ, "reference blend run failed");
+
+  if (inst->ik_count > 0) {
+    ozz_result_t r = locals_to_model(inst, locals.data(), ws->model);
+    if (r != OZZ_OK) return set_err(r, "reference ltm pre-IK failed");
+
+    for (int32_t i = 0; i < inst->ik_count; ++i) {
+      const ozz_ik_job_t& J = inst->ik[i];
+      if (J.weight <= 0.f) continue;
+
+      if (J.kind == OZZ_IK_AIM) {
+        const int32_t j = J.aim_joint;
+        if (j < 0 || j >= inst->num_joints) continue;
+
+        ozz::animation::IKAimJob job;
+        job.joint = &ws->model[j];
+        job.target = load3(J.aim_target_ms.x, J.aim_target_ms.y, J.aim_target_ms.z, 1.f);
+        job.forward = load3(J.forward_axis_ls.x, J.forward_axis_ls.y, J.forward_axis_ls.z, 0.f);
+        job.up = load3(J.up_axis_ls.x, J.up_axis_ls.y, J.up_axis_ls.z, 0.f);
+        job.offset = ozz::math::simd_float4::zero();
+        job.pole_vector = ozz::math::simd_float4::zero();
+        job.weight = J.weight;
+
+        ozz::math::SimdQuaternion corr;
+        job.joint_correction = &corr;
+
+        if (!job.Run()) return set_err(OZZ_ERR_OZZ, "reference IKAim failed");
+
+        apply_joint_rotation_correction(j, corr, locals.data(), inst->num_soa);
+
+      } else if (J.kind == OZZ_IK_TWO_BONE) {
+        const int32_t s = J.start_joint;
+        const int32_t m = J.mid_joint;
+        const int32_t e = J.end_joint;
+        if (s < 0 || m < 0 || e < 0) continue;
+        if (s >= inst->num_joints || m >= inst->num_joints || e >= inst->num_joints) continue;
+
+        ozz::animation::IKTwoBoneJob job;
+        job.start_joint = &ws->model[s];
+        job.mid_joint   = &ws->model[m];
+        job.end_joint   = &ws->model[e];
+
+        job.target = load3(J.target_ms.x, J.target_ms.y, J.target_ms.z, 1.f);
+        job.pole_vector = load3(J.pole_ms.x, J.pole_ms.y, J.pole_ms.z, 0.f);
+        job.mid_axis = ozz::math::simd_float4::z_axis();
+        job.weight = J.weight;
+        job.twist_angle = 0.f;
+        job.soften = 1.f;
+
+        ozz::math::SimdQuaternion sc, mc;
+        job.start_joint_correction = &sc;
+        job.mid_joint_correction   = &mc;
+
+        if (!job.Run()) return set_err(OZZ_ERR_OZZ, "reference IKTwoBone failed");
+
+        apply_joint_rotation_correction(s, sc, locals.data(), inst->num_soa);
+        apply_joint_rotation_correction(m, mc, locals.data(), inst->num_soa);
+      }
+    }
+  }
 
   ozz_result_t r = locals_to_model(inst, locals.data(), ws->model);
   if (r != OZZ_OK) return set_err(r, "reference ltm failed");

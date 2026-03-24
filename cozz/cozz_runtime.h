@@ -74,6 +74,8 @@ void ozz_skeleton_destroy(ozz_skeleton_t* skel);
 void ozz_animation_destroy(ozz_animation_t* anim);
 
 int32_t ozz_skeleton_num_joints(const ozz_skeleton_t* skel);
+int32_t ozz_skeleton_find_joint(const ozz_skeleton_t* skel, const char* name);
+const char* ozz_skeleton_joint_name(const ozz_skeleton_t* skel, int32_t joint);
 float   ozz_animation_duration(const ozz_animation_t* anim);
 
 // Instance (persistent, per entity)
