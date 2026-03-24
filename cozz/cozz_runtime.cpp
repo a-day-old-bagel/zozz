@@ -6,6 +6,7 @@
 #include <new>
 #include <cstring>
 #include <cstdint>
+#include <vector>
 
 #include "ozz/animation/runtime/skeleton.h"
 #include "ozz/animation/runtime/animation.h"
@@ -292,6 +293,35 @@ static inline ozz_result_t sample_into(ozz_instance_t* inst,
   return job.Run() ? OZZ_OK : OZZ_ERR_OZZ;
 }
 
+static inline ozz_result_t sample_into_context(int32_t num_joints,
+                                               int32_t num_soa,
+                                               ozz::animation::SamplingJob::Context* ctx,
+                                               const ozz_animation_t* anim_h,
+                                               float time_s,
+                                               int wrap,
+                                               ozz::math::SoaTransform* out) {
+  if (!ctx || !anim_h) return OZZ_ERR_INVALID_ARGUMENT;
+  if ((int32_t)anim_h->anim.num_tracks() != num_joints) return OZZ_ERR_INVALID_ARGUMENT;
+
+  const float dur = anim_h->anim.duration();
+  const float t = wrap_or_clamp(time_s, dur, wrap);
+  const float ratio = (dur > 0.0f) ? (t / dur) : 0.0f;
+
+  ozz::animation::SamplingJob job;
+  job.animation = &anim_h->anim;
+  job.context = ctx;
+  job.ratio = ratio;
+  job.output = ozz::span<ozz::math::SoaTransform>(out, num_soa);
+
+  return job.Run() ? OZZ_OK : OZZ_ERR_OZZ;
+}
+
+static inline bool should_skip_layer(const ozz_layer_desc_t& layer) {
+  if (!layer.anim || layer.weight == 0.f) return true;
+  if (layer.mode != OZZ_LAYER_ADDITIVE && layer.weight < 0.f) return true;
+  return false;
+}
+
 static inline ozz_result_t locals_to_model(const ozz_instance_t* inst,
                                            const ozz::math::SoaTransform* locals,
                                            ozz::math::Float4x4* out_model) {
@@ -358,7 +388,7 @@ ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
   // 1) sample layers into workspace buffers
   for (int32_t i = 0; i < inst->layer_count; ++i) {
     const ozz_layer_desc_t& L = inst->layers[i];
-    if (!L.anim || L.weight <= 0.f) continue;
+    if (should_skip_layer(L)) continue;
     if (L.mode == OZZ_LAYER_ADDITIVE) {
       if (additive_count >= OZZ_MAX_LAYERS) continue;
       ozz::math::SoaTransform* dst = ws->sampled_additive + (size_t)additive_count * (size_t)inst->num_soa;
@@ -462,6 +492,77 @@ ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
     for (int32_t i = 0; i < inst->num_joints; ++i) {
       store_3x4_col_major(ws->model[i], ws->palette + (size_t)i * 12u);
     }
+  }
+
+  return OZZ_OK;
+}
+
+ozz_result_t ozz_eval_model_3x4_reference(ozz_instance_t* inst, ozz_workspace_t* ws) {
+  ozz_clear_error();
+  if (!inst || !ws) return set_err(OZZ_ERR_INVALID_ARGUMENT, "null inst/ws");
+  if (inst->skel != ws->skel) return set_err(OZZ_ERR_INVALID_ARGUMENT, "skeleton mismatch");
+  if (inst->num_joints != ws->num_joints) return set_err(OZZ_ERR_INVALID_ARGUMENT, "size mismatch");
+  if (inst->layer_count <= 0) return set_err(OZZ_ERR_INVALID_ARGUMENT, "no layers");
+  if (inst->ik_count > 0) return set_err(OZZ_ERR_INVALID_ARGUMENT, "reference path does not support ik");
+
+  std::vector<ozz::math::SoaTransform> sampled_normal;
+  std::vector<ozz::math::SoaTransform> sampled_additive;
+  std::vector<ozz::animation::BlendingJob::Layer> normal_layers;
+  std::vector<ozz::animation::BlendingJob::Layer> additive_layers;
+  std::vector<ozz::math::SoaTransform> locals((size_t)inst->num_soa);
+  ozz::animation::SamplingJob::Context sampling_ctx(inst->num_joints);
+
+  sampled_normal.reserve((size_t)inst->num_soa * (size_t)OZZ_MAX_LAYERS);
+  sampled_additive.reserve((size_t)inst->num_soa * (size_t)OZZ_MAX_LAYERS);
+  normal_layers.reserve(OZZ_MAX_LAYERS);
+  additive_layers.reserve(OZZ_MAX_LAYERS);
+
+  for (int32_t i = 0; i < inst->layer_count; ++i) {
+    const ozz_layer_desc_t& L = inst->layers[i];
+    if (should_skip_layer(L)) continue;
+
+    if (L.mode == OZZ_LAYER_ADDITIVE) {
+      if ((int32_t)additive_layers.size() >= OZZ_MAX_LAYERS) continue;
+      const size_t offset = sampled_additive.size();
+      sampled_additive.resize(offset + (size_t)inst->num_soa);
+      ozz_result_t r = sample_into_context(inst->num_joints, inst->num_soa, &sampling_ctx, L.anim, L.time_seconds, L.wrap_time, sampled_additive.data() + offset);
+      if (r != OZZ_OK) return set_err(r, "reference sample failed");
+
+      ozz::animation::BlendingJob::Layer layer;
+      layer.transform = ozz::span<const ozz::math::SoaTransform>(sampled_additive.data() + offset, inst->num_soa);
+      layer.weight = L.weight;
+      additive_layers.push_back(layer);
+    } else {
+      if ((int32_t)normal_layers.size() >= OZZ_MAX_LAYERS) continue;
+      const size_t offset = sampled_normal.size();
+      sampled_normal.resize(offset + (size_t)inst->num_soa);
+      ozz_result_t r = sample_into_context(inst->num_joints, inst->num_soa, &sampling_ctx, L.anim, L.time_seconds, L.wrap_time, sampled_normal.data() + offset);
+      if (r != OZZ_OK) return set_err(r, "reference sample failed");
+
+      ozz::animation::BlendingJob::Layer layer;
+      layer.transform = ozz::span<const ozz::math::SoaTransform>(sampled_normal.data() + offset, inst->num_soa);
+      layer.weight = L.weight;
+      normal_layers.push_back(layer);
+    }
+  }
+
+  if (normal_layers.empty()) return set_err(OZZ_ERR_INVALID_ARGUMENT, "no normal layers");
+
+  ozz::animation::BlendingJob blend_job;
+  blend_job.threshold = 0.1f;
+  blend_job.rest_pose = inst->skel->joint_rest_poses();
+  blend_job.layers = ozz::span<const ozz::animation::BlendingJob::Layer>(normal_layers.data(), normal_layers.size());
+  blend_job.additive_layers = ozz::span<const ozz::animation::BlendingJob::Layer>(additive_layers.data(), additive_layers.size());
+  blend_job.output = ozz::span<ozz::math::SoaTransform>(locals.data(), locals.size());
+
+  if (!blend_job.Validate()) return set_err(OZZ_ERR_OZZ, "reference blend validate failed");
+  if (!blend_job.Run()) return set_err(OZZ_ERR_OZZ, "reference blend run failed");
+
+  ozz_result_t r = locals_to_model(inst, locals.data(), ws->model);
+  if (r != OZZ_OK) return set_err(r, "reference ltm failed");
+
+  for (int32_t i = 0; i < inst->num_joints; ++i) {
+    store_3x4_col_major(ws->model[i], ws->palette + (size_t)i * 12u);
   }
 
   return OZZ_OK;
