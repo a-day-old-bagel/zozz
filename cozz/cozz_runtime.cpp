@@ -28,6 +28,10 @@
 
 static thread_local std::string g_last_error;
 
+static inline bool vec3_is_near_zero(ozz_vec3_t v) {
+  return std::fabs(v.x) + std::fabs(v.y) + std::fabs(v.z) < 1e-6f;
+}
+
 static ozz_result_t set_err(ozz_result_t code, const char* msg) {
   g_last_error = msg ? msg : "";
   return code;
@@ -492,10 +496,16 @@ ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
         ozz::animation::IKAimJob job;
         job.joint = &ws->model[j];
         job.target = load3(J.aim_target_ms.x, J.aim_target_ms.y, J.aim_target_ms.z, 1.f);
-        job.forward = load3(J.forward_axis_ls.x, J.forward_axis_ls.y, J.forward_axis_ls.z, 0.f);
-        job.up = load3(J.up_axis_ls.x, J.up_axis_ls.y, J.up_axis_ls.z, 0.f);
+        job.forward = vec3_is_near_zero(J.forward_axis_ls)
+            ? ozz::math::simd_float4::x_axis()
+            : load3(J.forward_axis_ls.x, J.forward_axis_ls.y, J.forward_axis_ls.z, 0.f);
+        job.up = vec3_is_near_zero(J.up_axis_ls)
+            ? ozz::math::simd_float4::y_axis()
+            : load3(J.up_axis_ls.x, J.up_axis_ls.y, J.up_axis_ls.z, 0.f);
         job.offset = ozz::math::simd_float4::zero();
-        job.pole_vector = ozz::math::simd_float4::zero();
+        job.pole_vector = vec3_is_near_zero(J.aim_pole_vector_ms)
+            ? ozz::math::simd_float4::y_axis()
+            : load3(J.aim_pole_vector_ms.x, J.aim_pole_vector_ms.y, J.aim_pole_vector_ms.z, 0.f);
         job.weight = J.weight;
 
         ozz::math::SimdQuaternion corr;
@@ -518,12 +528,15 @@ ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
         job.end_joint   = &ws->model[e];
 
         job.target = load3(J.target_ms.x, J.target_ms.y, J.target_ms.z, 1.f);
-        job.pole_vector = load3(J.pole_ms.x, J.pole_ms.y, J.pole_ms.z, 0.f);
-                  
-        job.mid_axis = ozz::math::simd_float4::z_axis();
+        job.pole_vector = vec3_is_near_zero(J.pole_ms)
+            ? ozz::math::simd_float4::y_axis()
+            : load3(J.pole_ms.x, J.pole_ms.y, J.pole_ms.z, 0.f);
+        job.mid_axis = vec3_is_near_zero(J.mid_axis_ls)
+            ? ozz::math::simd_float4::z_axis()
+            : load3(J.mid_axis_ls.x, J.mid_axis_ls.y, J.mid_axis_ls.z, 0.f);
         job.weight = J.weight;
-        job.twist_angle = 0.f;
-        job.soften = 1.f;
+        job.twist_angle = J.twist_angle;
+        job.soften = J.soften;
 
         ozz::math::SimdQuaternion sc, mc;
         job.start_joint_correction = &sc;
@@ -630,10 +643,16 @@ ozz_result_t ozz_eval_model_3x4_reference(ozz_instance_t* inst, ozz_workspace_t*
         ozz::animation::IKAimJob job;
         job.joint = &ws->model[j];
         job.target = load3(J.aim_target_ms.x, J.aim_target_ms.y, J.aim_target_ms.z, 1.f);
-        job.forward = load3(J.forward_axis_ls.x, J.forward_axis_ls.y, J.forward_axis_ls.z, 0.f);
-        job.up = load3(J.up_axis_ls.x, J.up_axis_ls.y, J.up_axis_ls.z, 0.f);
+        job.forward = vec3_is_near_zero(J.forward_axis_ls)
+            ? ozz::math::simd_float4::x_axis()
+            : load3(J.forward_axis_ls.x, J.forward_axis_ls.y, J.forward_axis_ls.z, 0.f);
+        job.up = vec3_is_near_zero(J.up_axis_ls)
+            ? ozz::math::simd_float4::y_axis()
+            : load3(J.up_axis_ls.x, J.up_axis_ls.y, J.up_axis_ls.z, 0.f);
         job.offset = ozz::math::simd_float4::zero();
-        job.pole_vector = ozz::math::simd_float4::zero();
+        job.pole_vector = vec3_is_near_zero(J.aim_pole_vector_ms)
+            ? ozz::math::simd_float4::y_axis()
+            : load3(J.aim_pole_vector_ms.x, J.aim_pole_vector_ms.y, J.aim_pole_vector_ms.z, 0.f);
         job.weight = J.weight;
 
         ozz::math::SimdQuaternion corr;
@@ -656,11 +675,15 @@ ozz_result_t ozz_eval_model_3x4_reference(ozz_instance_t* inst, ozz_workspace_t*
         job.end_joint   = &ws->model[e];
 
         job.target = load3(J.target_ms.x, J.target_ms.y, J.target_ms.z, 1.f);
-        job.pole_vector = load3(J.pole_ms.x, J.pole_ms.y, J.pole_ms.z, 0.f);
-        job.mid_axis = ozz::math::simd_float4::z_axis();
+        job.pole_vector = vec3_is_near_zero(J.pole_ms)
+            ? ozz::math::simd_float4::y_axis()
+            : load3(J.pole_ms.x, J.pole_ms.y, J.pole_ms.z, 0.f);
+        job.mid_axis = vec3_is_near_zero(J.mid_axis_ls)
+            ? ozz::math::simd_float4::z_axis()
+            : load3(J.mid_axis_ls.x, J.mid_axis_ls.y, J.mid_axis_ls.z, 0.f);
         job.weight = J.weight;
-        job.twist_angle = 0.f;
-        job.soften = 1.f;
+        job.twist_angle = J.twist_angle;
+        job.soften = J.soften;
 
         ozz::math::SimdQuaternion sc, mc;
         job.start_joint_correction = &sc;

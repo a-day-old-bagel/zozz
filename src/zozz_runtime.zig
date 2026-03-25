@@ -113,12 +113,27 @@ pub const IkJob = extern struct {
     end_joint: i32,
     target_ms: Vec3,
     pole_ms: Vec3,
+    mid_axis_ls: Vec3,
+    twist_angle: f32,
+    soften: f32,
     aim_joint: i32,
     aim_target_ms: Vec3,
     forward_axis_ls: Vec3,
     up_axis_ls: Vec3,
+    aim_pole_vector_ms: Vec3,
 
     pub fn aim(joint: i32, target_ms: Vec3, forward_axis_ls: Vec3, up_axis_ls: Vec3, weight: f32) IkJob {
+        return aimWithPole(joint, target_ms, forward_axis_ls, up_axis_ls, .{ .x = 0, .y = 1, .z = 0 }, weight);
+    }
+
+    pub fn aimWithPole(
+        joint: i32,
+        target_ms: Vec3,
+        forward_axis_ls: Vec3,
+        up_axis_ls: Vec3,
+        pole_vector_ms: Vec3,
+        weight: f32,
+    ) IkJob {
         return .{
             .kind = c.OZZ_IK_AIM,
             .weight = weight,
@@ -127,14 +142,42 @@ pub const IkJob = extern struct {
             .end_joint = -1,
             .target_ms = .{ .x = 0, .y = 0, .z = 0 },
             .pole_ms = .{ .x = 0, .y = 0, .z = 0 },
+            .mid_axis_ls = .{ .x = 0, .y = 0, .z = 1 },
+            .twist_angle = 0,
+            .soften = 1,
             .aim_joint = joint,
             .aim_target_ms = target_ms,
             .forward_axis_ls = forward_axis_ls,
             .up_axis_ls = up_axis_ls,
+            .aim_pole_vector_ms = pole_vector_ms,
         };
     }
 
     pub fn twoBone(start_joint: i32, mid_joint: i32, end_joint: i32, target_ms: Vec3, pole_ms: Vec3, weight: f32) IkJob {
+        return twoBoneAdvanced(
+            start_joint,
+            mid_joint,
+            end_joint,
+            target_ms,
+            pole_ms,
+            .{ .x = 0, .y = 0, .z = 1 },
+            0,
+            1,
+            weight,
+        );
+    }
+
+    pub fn twoBoneAdvanced(
+        start_joint: i32,
+        mid_joint: i32,
+        end_joint: i32,
+        target_ms: Vec3,
+        pole_ms: Vec3,
+        mid_axis_ls: Vec3,
+        twist_angle: f32,
+        soften: f32,
+        weight: f32,
+    ) IkJob {
         return .{
             .kind = c.OZZ_IK_TWO_BONE,
             .weight = weight,
@@ -143,10 +186,14 @@ pub const IkJob = extern struct {
             .end_joint = end_joint,
             .target_ms = target_ms,
             .pole_ms = pole_ms,
+            .mid_axis_ls = mid_axis_ls,
+            .twist_angle = twist_angle,
+            .soften = soften,
             .aim_joint = -1,
             .aim_target_ms = .{ .x = 0, .y = 0, .z = 0 },
             .forward_axis_ls = .{ .x = 0, .y = 0, .z = 0 },
             .up_axis_ls = .{ .x = 0, .y = 0, .z = 0 },
+            .aim_pole_vector_ms = .{ .x = 0, .y = 1, .z = 0 },
         };
     }
 };
@@ -233,10 +280,14 @@ pub const Instance = struct {
                 .end_joint = job.end_joint,
                 .target_ms = .{ .x = job.target_ms.x, .y = job.target_ms.y, .z = job.target_ms.z },
                 .pole_ms = .{ .x = job.pole_ms.x, .y = job.pole_ms.y, .z = job.pole_ms.z },
+                .mid_axis_ls = .{ .x = job.mid_axis_ls.x, .y = job.mid_axis_ls.y, .z = job.mid_axis_ls.z },
+                .twist_angle = job.twist_angle,
+                .soften = job.soften,
                 .aim_joint = job.aim_joint,
                 .aim_target_ms = .{ .x = job.aim_target_ms.x, .y = job.aim_target_ms.y, .z = job.aim_target_ms.z },
                 .forward_axis_ls = .{ .x = job.forward_axis_ls.x, .y = job.forward_axis_ls.y, .z = job.forward_axis_ls.z },
                 .up_axis_ls = .{ .x = job.up_axis_ls.x, .y = job.up_axis_ls.y, .z = job.up_axis_ls.z },
+                .aim_pole_vector_ms = .{ .x = job.aim_pole_vector_ms.x, .y = job.aim_pole_vector_ms.y, .z = job.aim_pole_vector_ms.z },
             };
         }
 
@@ -781,7 +832,14 @@ test "aim IK matches upstream reference and changes the pose" {
     const aim_target = vec3Add(head_pos, .{ .x = 0.75, .y = 0.25, .z = -0.50 });
 
     inst.setIkJobs(&[_]IkJob{
-        IkJob.aim(head_joint, aim_target, .{ .x = 0, .y = 1, .z = 0 }, .{ .x = 1, .y = 0, .z = 0 }, 1.0),
+        IkJob.aimWithPole(
+            head_joint,
+            aim_target,
+            .{ .x = 1, .y = 0, .z = 0 },
+            .{ .x = 0, .y = 1, .z = 0 },
+            .{ .x = 0, .y = 1, .z = 0 },
+            1.0,
+        ),
     });
 
     const actual = try copyPalette(A, try evalModel3x4(&inst, &ws_actual));
@@ -833,7 +891,17 @@ test "two-bone IK matches upstream reference and changes the pose" {
     const target = vec3Add(ankle_pos, .{ .x = 0.15, .y = -0.10, .z = 0.10 });
 
     inst.setIkJobs(&[_]IkJob{
-        IkJob.twoBone(hip, knee, ankle, target, knee_pole, 1.0),
+        IkJob.twoBoneAdvanced(
+            hip,
+            knee,
+            ankle,
+            target,
+            knee_pole,
+            .{ .x = 0, .y = 0, .z = 1 },
+            0.0,
+            0.8,
+            1.0,
+        ),
     });
 
     const actual = try copyPalette(A, try evalModel3x4(&inst, &ws_actual));

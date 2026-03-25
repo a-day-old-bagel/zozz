@@ -60,13 +60,17 @@ typedef struct ozz_ik_job_t {
   int32_t mid_joint;
   int32_t end_joint;
   ozz_vec3_t target_ms;
-  ozz_vec3_t pole_ms;
+  ozz_vec3_t pole_ms;        // legacy name: this is a model-space pole vector
+  ozz_vec3_t mid_axis_ls;    // middle joint bend axis, local-space
+  float twist_angle;
+  float soften;
 
   // AIM
   int32_t aim_joint;
   ozz_vec3_t aim_target_ms;
   ozz_vec3_t forward_axis_ls;
   ozz_vec3_t up_axis_ls;
+  ozz_vec3_t aim_pole_vector_ms;
 } ozz_ik_job_t;
 
 // Loading
