@@ -60,15 +60,16 @@ const Controls = struct {
     orbit_camera: bool = true,
     show_target: bool = true,
     show_joint_axes: bool = true,
-    arm_weight: f32 = 0.85,
-    arm_soften: f32 = 0.8,
-    head_weight: f32 = 0.35,
-    target_side: f32 = 0.18,
-    target_lift: f32 = 0.08,
-    target_forward: f32 = -0.32,
+    arm_weight: f32 = 0.95,
+    arm_soften: f32 = 0.50,
+    head_weight: f32 = 0.75,
+    target_side: f32 = 0.08,
+    target_lift: f32 = 0.15,
+    target_forward: f32 = 0.15,
     target_sway: f32 = 0.10,
     target_bob: f32 = 0.08,
     elbow_axis: AxisChoice = .pos_z,
+    arm_pole_axis: AxisChoice = .neg_z,
     head_forward_axis: AxisChoice = .pos_y,
     head_up_axis: AxisChoice = .pos_x,
 };
@@ -82,6 +83,7 @@ const InputState = struct {
     toggle_orbit_camera: bool = false,
     toggle_joint_axes: bool = false,
     cycle_elbow_axis: bool = false,
+    cycle_arm_pole_axis: bool = false,
     cycle_head_forward_axis: bool = false,
     cycle_head_up_axis: bool = false,
     blend_down: bool = false,
@@ -135,6 +137,7 @@ const DemoState = struct {
     controls: Controls,
     input: InputState,
     current_target_ms: [3]f32,
+    current_hand_distance: f32,
 };
 
 fn init(allocator: std.mem.Allocator, window: *zglfw.Window) !DemoState {
@@ -275,6 +278,7 @@ fn init(allocator: std.mem.Allocator, window: *zglfw.Window) !DemoState {
         .controls = .{},
         .input = .{},
         .current_target_ms = .{ 0.0, 1.2, -0.6 },
+        .current_hand_distance = 0.0,
     };
 }
 
@@ -432,15 +436,12 @@ fn updateSkeletonVertices(demo: *DemoState, time_seconds: f32) !usize {
     }
 
     if (demo.controls.enable_arm_ik and demo.arm_chain.isValid()) {
-        const shoulder_pos = paletteTranslation(base_palette, @intCast(demo.arm_chain.start_joint));
-        const elbow_pos = paletteTranslation(base_palette, @intCast(demo.arm_chain.mid_joint));
-        const elbow_pole = normalized3(sub3(elbow_pos, shoulder_pos), [3]f32{ 0.0, 1.0, 0.0 });
         jobs[job_count] = zozz.IkJob.twoBoneAdvanced(
             demo.arm_chain.start_joint,
             demo.arm_chain.mid_joint,
             demo.arm_chain.end_joint,
             toVec3(target_ms),
-            toVec3(elbow_pole),
+            axisChoiceVec3(demo.controls.arm_pole_axis),
             axisChoiceVec3(demo.controls.elbow_axis),
             0.0,
             demo.controls.arm_soften,
@@ -466,8 +467,16 @@ fn updateSkeletonVertices(demo: *DemoState, time_seconds: f32) !usize {
         appendTargetMarker(demo.line_vertices, &vertex_count, target_ms);
         if (demo.arm_chain.isValid()) {
             const hand_after_ik = paletteTranslation(palette, @intCast(demo.arm_chain.end_joint));
+            demo.current_hand_distance = length3(sub3(target_ms, hand_after_ik));
             appendLine(demo.line_vertices, &vertex_count, hand_after_ik, target_ms, .{ 1.0, 0.72, 0.24 });
+        } else {
+            demo.current_hand_distance = 0.0;
         }
+    } else if (demo.arm_chain.isValid()) {
+        const hand_after_ik = paletteTranslation(palette, @intCast(demo.arm_chain.end_joint));
+        demo.current_hand_distance = length3(sub3(target_ms, hand_after_ik));
+    } else {
+        demo.current_hand_distance = 0.0;
     }
 
     if (demo.controls.show_joint_axes) {
@@ -600,7 +609,7 @@ fn printControls() void {
     std.debug.print(
         \\Controls:
         \\  1 auto blend   2 additive   3 arm IK   4 head aim   5 target marker   6 orbit camera   7 joint axes
-        \\  Q elbow axis   W head forward axis   E head up axis
+        \\  Q elbow axis   Y arm pole axis   W head forward axis   E head up axis
         \\  A/D blend      S/F arm weight        G/H arm soften
         \\  X/C head weight
         \\  R/T target forward     V/B target lift
@@ -623,7 +632,7 @@ fn printResolvedJoints(demo: *const DemoState) void {
 
 fn printControlState(demo: *const DemoState) void {
     std.debug.print(
-        "State: blend={d:.2} auto={s} add={s} arm={s} head={s} target={s} axes={s} orbit={s} arm_weight={d:.2} arm_soften={d:.2} head_weight={d:.2} target_forward={d:.2} target_lift={d:.2} elbow={s} head_forward={s} head_up={s}\n",
+        "State: blend={d:.2} auto={s} add={s} arm={s} head={s} target={s} axes={s} orbit={s} arm_weight={d:.2} arm_soften={d:.2} hand_dist={d:.3} head_weight={d:.2} target_forward={d:.2} target_lift={d:.2} elbow={s} arm_pole={s} head_forward={s} head_up={s}\n",
         .{
             demo.controls.blend,
             onOff(demo.controls.auto_blend),
@@ -635,10 +644,12 @@ fn printControlState(demo: *const DemoState) void {
             onOff(demo.controls.orbit_camera),
             demo.controls.arm_weight,
             demo.controls.arm_soften,
+            demo.current_hand_distance,
             demo.controls.head_weight,
             demo.controls.target_forward,
             demo.controls.target_lift,
             axisChoiceLabel(demo.controls.elbow_axis),
+            axisChoiceLabel(demo.controls.arm_pole_axis),
             axisChoiceLabel(demo.controls.head_forward_axis),
             axisChoiceLabel(demo.controls.head_up_axis),
         },
@@ -686,6 +697,10 @@ fn handleInput(window: *zglfw.Window, demo: *DemoState) void {
     }
     if (consumeEdge(window, .q, &demo.input.cycle_elbow_axis)) {
         demo.controls.elbow_axis = nextAxisChoice(demo.controls.elbow_axis);
+        changed = true;
+    }
+    if (consumeEdge(window, .y, &demo.input.cycle_arm_pole_axis)) {
+        demo.controls.arm_pole_axis = nextAxisChoice(demo.controls.arm_pole_axis);
         changed = true;
     }
     if (consumeEdge(window, .w, &demo.input.cycle_head_forward_axis)) {
@@ -742,12 +757,15 @@ fn updateWindowTitle(window: *zglfw.Window, demo: *const DemoState) void {
     var buffer: [256]u8 = undefined;
     const title = std.fmt.bufPrintZ(
         &buffer,
-        "{s} | blend {d:.2} | arm {s} {d:.2} | head {s} {d:.2} | add {s} | axes {s} | elbow {s}",
+        "{s} | blend {d:.2} | arm {s} {d:.2} s{d:.2} d{d:.3} | pole {s} | head {s} {d:.2} | add {s} | axes {s} | elbow {s}",
         .{
             window_title,
             demo.controls.blend,
             onOff(demo.controls.enable_arm_ik),
             demo.controls.arm_weight,
+            demo.controls.arm_soften,
+            demo.current_hand_distance,
+            axisChoiceLabel(demo.controls.arm_pole_axis),
             onOff(demo.controls.enable_head_aim),
             demo.controls.head_weight,
             onOff(demo.controls.enable_additive),
@@ -860,6 +878,10 @@ fn normalized3(v: [3]f32, fallback: [3]f32) [3]f32 {
     if (len_sq <= 1e-8) return fallback;
     const inv_len = 1.0 / @sqrt(len_sq);
     return .{ v[0] * inv_len, v[1] * inv_len, v[2] * inv_len };
+}
+
+fn length3(v: [3]f32) f32 {
+    return @sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
 }
 
 fn toVec3(v: [3]f32) zozz.Vec3 {

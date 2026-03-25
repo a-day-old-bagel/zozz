@@ -405,8 +405,9 @@ static inline void apply_joint_rotation_correction(
   // Build local quaternion (SIMD)
   ozz::math::SimdQuaternion local_q = { ozz::math::simd_float4::Load(xs[lane], ys[lane], zs[lane], ws[lane])};
 
-  // Multiply & normalize using ozz helpers
-  const ozz::math::SimdQuaternion out = ozz::math::Normalize(corr * local_q);
+  // Upstream Ozz samples post-multiply the returned correction onto the
+  // existing local rotation.
+  const ozz::math::SimdQuaternion out = ozz::math::Normalize(local_q * corr);
 
   // Write back
   alignas(16) float out4[4];

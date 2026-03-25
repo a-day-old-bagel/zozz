@@ -376,6 +376,14 @@ fn vec3Add(a: Vec3, b: Vec3) Vec3 {
     return .{ .x = a.x + b.x, .y = a.y + b.y, .z = a.z + b.z };
 }
 
+fn vec3Sub(a: Vec3, b: Vec3) Vec3 {
+    return .{ .x = a.x - b.x, .y = a.y - b.y, .z = a.z - b.z };
+}
+
+fn vec3Length(v: Vec3) f32 {
+    return @sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+}
+
 fn paletteDifferenceL1(a: []const f32, b: []const f32) f32 {
     var sum: f32 = 0;
     for (a, b) |av, bv| sum += @abs(av - bv);
@@ -889,6 +897,7 @@ test "two-bone IK matches upstream reference and changes the pose" {
     const ankle_pos = paletteTranslation(base_palette, @intCast(ankle));
     const knee_pole = paletteColumn(base_palette, @intCast(knee), 1);
     const target = vec3Add(ankle_pos, .{ .x = 0.15, .y = -0.10, .z = 0.10 });
+    const base_distance = vec3Length(vec3Sub(target, ankle_pos));
 
     inst.setIkJobs(&[_]IkJob{
         IkJob.twoBoneAdvanced(
@@ -899,7 +908,7 @@ test "two-bone IK matches upstream reference and changes the pose" {
             knee_pole,
             .{ .x = 0, .y = 0, .z = 1 },
             0.0,
-            0.8,
+            1.0,
             1.0,
         ),
     });
@@ -910,4 +919,8 @@ test "two-bone IK matches upstream reference and changes the pose" {
     const reference = try evalModel3x4Reference(&inst, &ws_reference);
     try expectSlicesApproxEqAbs(reference, actual, 1e-4);
     try std.testing.expect(paletteDifferenceL1(base_palette, actual) > 1e-3);
+
+    const actual_ankle = paletteTranslation(actual, @intCast(ankle));
+    const actual_distance = vec3Length(vec3Sub(target, actual_ankle));
+    try std.testing.expect(actual_distance < base_distance * 0.4);
 }
