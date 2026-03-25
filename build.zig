@@ -1,5 +1,12 @@
 const std = @import("std");
 
+const ExampleOptions = struct {
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    zozz_runtime: *std.Build.Module,
+    cozz_runtime: *std.Build.Step.Compile,
+};
+
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const target = b.standardTargetOptions(.{});
@@ -67,6 +74,34 @@ pub fn build(b: *std.Build) void {
     cozz_offline.linkLibCpp();
 
     //
+    // Example
+    //
+
+    const debug_skeleton = buildDebugSkeletonExample(b, .{
+        .target = target,
+        .optimize = optimize,
+        .zozz_runtime = zozz_runtime,
+        .cozz_runtime = cozz_runtime,
+    });
+    b.installArtifact(debug_skeleton);
+
+    const install_assets = b.addInstallDirectory(.{
+        .source_dir = b.path("assets"),
+        .install_dir = .{ .custom = "" },
+        .install_subdir = "bin/assets",
+    });
+    b.getInstallStep().dependOn(&install_assets.step);
+
+    const debug_skeleton_step = b.step("debug-skeleton", "Build the debug skeleton WGPU example");
+    debug_skeleton_step.dependOn(&debug_skeleton.step);
+
+    const run_debug_skeleton = b.addRunArtifact(debug_skeleton);
+    run_debug_skeleton.step.dependOn(b.getInstallStep());
+
+    const debug_skeleton_run_step = b.step("debug-skeleton-run", "Build and run the debug skeleton WGPU example");
+    debug_skeleton_run_step.dependOn(&run_debug_skeleton.step);
+
+    //
     // Tests
     //
 
@@ -93,4 +128,41 @@ pub fn build(b: *std.Build) void {
     tests_offline.addIncludePath(b.path("cozz"));
     tests_offline.linkLibrary(cozz_offline);
     test_step.dependOn(&b.addRunArtifact(tests_offline).step);
+}
+
+fn buildDebugSkeletonExample(b: *std.Build, options: ExampleOptions) *std.Build.Step.Compile {
+    const exe = b.addExecutable(.{
+        .name = "debug_skeleton_wgpu",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/debug_skeleton_wgpu.zig"),
+            .target = options.target,
+            .optimize = options.optimize,
+        }),
+    });
+
+    exe.root_module.addImport("zozz_runtime", options.zozz_runtime);
+    exe.linkLibrary(options.cozz_runtime);
+
+    const zglfw = b.dependency("zglfw", .{
+        .target = options.target,
+        .optimize = options.optimize,
+    });
+    exe.root_module.addImport("zglfw", zglfw.module("root"));
+    exe.linkLibrary(zglfw.artifact("glfw"));
+
+    @import("zgpu").addLibraryPathsTo(exe);
+    const zgpu = b.dependency("zgpu", .{
+        .target = options.target,
+        .optimize = options.optimize,
+    });
+    exe.root_module.addImport("zgpu", zgpu.module("root"));
+    exe.linkLibrary(zgpu.artifact("zdawn"));
+
+    const zmath = b.dependency("zmath", .{
+        .target = options.target,
+        .optimize = options.optimize,
+    });
+    exe.root_module.addImport("zmath", zmath.module("root"));
+
+    return exe;
 }

@@ -67,6 +67,10 @@ pub const Skeleton = struct {
         return std.mem.span(ptr);
     }
 
+    pub fn jointParent(self: Skeleton, joint: i32) i32 {
+        return c.ozz_skeleton_joint_parent(self.handle, joint);
+    }
+
     pub fn instanceBytes(self: Skeleton) usize {
         return c.ozz_instance_required_bytes(self.handle);
     }
@@ -372,6 +376,31 @@ test "ozz C ABI wrapper: load + 2-clip blend + 3x4 palette is sane" {
         try std.testing.expect(std.math.isFinite(ty));
         try std.testing.expect(std.math.isFinite(tz));
     }
+}
+
+test "skeleton joint parent queries are structurally sane" {
+    var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
+    defer skel.deinit();
+
+    const joints = skel.numJoints();
+    try std.testing.expect(joints > 0);
+
+    var root_count: i32 = 0;
+    for (0..@as(usize, @intCast(joints))) |joint_usize| {
+        const joint: i32 = @intCast(joint_usize);
+        try std.testing.expect(skel.jointName(joint) != null);
+
+        const parent = skel.jointParent(joint);
+        if (parent < 0) {
+            root_count += 1;
+            continue;
+        }
+
+        try std.testing.expect(parent < joints);
+        try std.testing.expect(skel.jointName(parent) != null);
+    }
+
+    try std.testing.expect(root_count >= 1);
 }
 
 test "evalModel3x4 matches upstream reference for a single normal clip" {

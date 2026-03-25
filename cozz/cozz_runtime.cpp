@@ -109,6 +109,12 @@ const char* ozz_skeleton_joint_name(const ozz_skeleton_t* skel, int32_t joint) {
   if (joint < 0 || joint >= (int32_t)names.size()) return nullptr;
   return names[(size_t)joint];
 }
+int32_t ozz_skeleton_joint_parent(const ozz_skeleton_t* skel, int32_t joint) {
+  if (!skel) return -1;
+  const auto parents = skel->skel.joint_parents();
+  if (joint < 0 || joint >= (int32_t)parents.size()) return -1;
+  return (int32_t)parents[(size_t)joint];
+}
 float ozz_animation_duration(const ozz_animation_t* anim) {
   return anim ? anim->anim.duration() : 0.0f;
 }
