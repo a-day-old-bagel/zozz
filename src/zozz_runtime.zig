@@ -162,6 +162,7 @@ pub const Layer = struct {
     wrap_time: bool = true,
     weight: f32,
     mode: LayerMode = .normal,
+    joint_weights: ?[]const f32 = null,
 };
 
 // --------------------
@@ -202,6 +203,8 @@ pub const Instance = struct {
                 .wrap_time = @intFromBool(L.wrap_time),
                 .weight = L.weight,
                 .mode = @intCast(@intFromEnum(L.mode)),
+                .joint_weights = if (L.joint_weights) |weights| weights.ptr else null,
+                .joint_weights_count = if (L.joint_weights) |weights| @intCast(weights.len) else 0,
             };
         }
 
@@ -498,6 +501,167 @@ test "evalModel3x4 matches upstream reference for negative additive weights" {
     inst.setLayers(&[_]Layer{
         .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
         .{ .anim = curl, .time_seconds = 0.0, .wrap_time = true, .weight = -0.50, .mode = .additive },
+    });
+
+    const actual = try copyPalette(A, try evalModel3x4(&inst, &ws_actual));
+    defer A.free(actual);
+
+    const reference = try evalModel3x4Reference(&inst, &ws_reference);
+    try expectSlicesApproxEqAbs(reference, actual, 1e-4);
+}
+
+test "partial normal layer masks obey zero and one semantics" {
+    const A = std.testing.allocator;
+
+    var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
+    defer skel.deinit();
+
+    var walk = try Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
+    defer walk.deinit();
+
+    var jog = try Animation.loadFromFileZ("assets/pab_jog_no_motion.ozz");
+    defer jog.deinit();
+
+    var inst = try Instance.init(A, skel);
+    defer inst.deinit(A);
+
+    var ws_a = try Workspace.init(A, skel);
+    defer ws_a.deinit(A);
+
+    var ws_b = try Workspace.init(A, skel);
+    defer ws_b.deinit(A);
+
+    const joints: usize = @intCast(skel.numJoints());
+    const zero_mask = try A.alloc(f32, joints);
+    defer A.free(zero_mask);
+    @memset(zero_mask, 0);
+
+    const one_mask = try A.alloc(f32, joints);
+    defer A.free(one_mask);
+    @memset(one_mask, 1);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
+    });
+    const base = try copyPalette(A, try evalModel3x4(&inst, &ws_a));
+    defer A.free(base);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
+        .{ .anim = jog, .time_seconds = 0.25, .wrap_time = true, .weight = 0.5, .mode = .normal, .joint_weights = zero_mask },
+    });
+    const zeroed = try evalModel3x4(&inst, &ws_b);
+    try expectSlicesApproxEqAbs(base, zeroed, 1e-4);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
+        .{ .anim = jog, .time_seconds = 0.25, .wrap_time = true, .weight = 0.5, .mode = .normal },
+    });
+    const unmasked = try copyPalette(A, try evalModel3x4(&inst, &ws_a));
+    defer A.free(unmasked);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
+        .{ .anim = jog, .time_seconds = 0.25, .wrap_time = true, .weight = 0.5, .mode = .normal, .joint_weights = one_mask },
+    });
+    const ones = try evalModel3x4(&inst, &ws_b);
+    try expectSlicesApproxEqAbs(unmasked, ones, 1e-4);
+}
+
+test "partial additive layer masks obey zero and one semantics" {
+    const A = std.testing.allocator;
+
+    var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
+    defer skel.deinit();
+
+    var walk = try Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
+    defer walk.deinit();
+
+    var curl = try Animation.loadFromFileZ("assets/pab_curl_additive.ozz");
+    defer curl.deinit();
+
+    var inst = try Instance.init(A, skel);
+    defer inst.deinit(A);
+
+    var ws_a = try Workspace.init(A, skel);
+    defer ws_a.deinit(A);
+
+    var ws_b = try Workspace.init(A, skel);
+    defer ws_b.deinit(A);
+
+    const joints: usize = @intCast(skel.numJoints());
+    const zero_mask = try A.alloc(f32, joints);
+    defer A.free(zero_mask);
+    @memset(zero_mask, 0);
+
+    const one_mask = try A.alloc(f32, joints);
+    defer A.free(one_mask);
+    @memset(one_mask, 1);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
+    });
+    const base = try copyPalette(A, try evalModel3x4(&inst, &ws_a));
+    defer A.free(base);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
+        .{ .anim = curl, .time_seconds = 0.0, .wrap_time = true, .weight = 0.6, .mode = .additive, .joint_weights = zero_mask },
+    });
+    const zeroed = try evalModel3x4(&inst, &ws_b);
+    try expectSlicesApproxEqAbs(base, zeroed, 1e-4);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
+        .{ .anim = curl, .time_seconds = 0.0, .wrap_time = true, .weight = 0.6, .mode = .additive },
+    });
+    const unmasked = try copyPalette(A, try evalModel3x4(&inst, &ws_a));
+    defer A.free(unmasked);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
+        .{ .anim = curl, .time_seconds = 0.0, .wrap_time = true, .weight = 0.6, .mode = .additive, .joint_weights = one_mask },
+    });
+    const ones = try evalModel3x4(&inst, &ws_b);
+    try expectSlicesApproxEqAbs(unmasked, ones, 1e-4);
+}
+
+test "partial normal blend with sparse mask matches upstream reference" {
+    const A = std.testing.allocator;
+
+    var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
+    defer skel.deinit();
+
+    var walk = try Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
+    defer walk.deinit();
+
+    var run = try Animation.loadFromFileZ("assets/pab_run_no_motion.ozz");
+    defer run.deinit();
+
+    var inst = try Instance.init(A, skel);
+    defer inst.deinit(A);
+
+    var ws_actual = try Workspace.init(A, skel);
+    defer ws_actual.deinit(A);
+
+    var ws_reference = try Workspace.init(A, skel);
+    defer ws_reference.deinit(A);
+
+    const joints: usize = @intCast(skel.numJoints());
+    const mask = try A.alloc(f32, joints);
+    defer A.free(mask);
+
+    for (mask, 0..) |*weight, j| {
+        weight.* = switch (j % 4) {
+            0 => 1.0,
+            1 => 0.5,
+            else => 0.0,
+        };
+    }
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
+        .{ .anim = run, .time_seconds = 0.30, .wrap_time = true, .weight = 0.7, .mode = .normal, .joint_weights = mask },
     });
 
     const actual = try copyPalette(A, try evalModel3x4(&inst, &ws_actual));

@@ -122,8 +122,10 @@ struct ozz_instance_t {
   ozz::animation::SamplingJob::Context sampling_ctx;
 
   ozz::math::SoaTransform* accum; // persistent pose (SoA)
+  ozz::math::SimdFloat4* layer_joint_weights; // [OZZ_MAX_LAYERS * num_soa]
 
   ozz_layer_desc_t layers[OZZ_MAX_LAYERS];
+  uint8_t layer_has_joint_weights[OZZ_MAX_LAYERS];
   int32_t layer_count;
 
   ozz_ik_job_t ik[OZZ_MAX_IK_JOBS];
@@ -151,6 +153,7 @@ size_t ozz_instance_required_bytes(const ozz_skeleton_t* skel_h) {
 
   bump(sizeof(ozz_instance_t), alignof(ozz_instance_t));
   bump(sizeof(ozz::math::SoaTransform) * (size_t)ns, alignof(ozz::math::SoaTransform));
+  bump(sizeof(ozz::math::SimdFloat4) * (size_t)(ns * OZZ_MAX_LAYERS), alignof(ozz::math::SimdFloat4));
   return bytes;
 }
 
@@ -173,8 +176,12 @@ ozz_result_t ozz_instance_init(void* mem, size_t mem_bytes, const ozz_skeleton_t
   inst->accum = bump_alloc<ozz::math::SoaTransform>(cur, left, (size_t)inst->num_soa);
   if (!inst->accum) return set_err(OZZ_ERR_INVALID_ARGUMENT, "mem too small (accum)");
 
+  inst->layer_joint_weights = bump_alloc<ozz::math::SimdFloat4>(cur, left, (size_t)(inst->num_soa * OZZ_MAX_LAYERS));
+  if (!inst->layer_joint_weights) return set_err(OZZ_ERR_INVALID_ARGUMENT, "mem too small (layer_joint_weights)");
+
   inst->layer_count = 0;
   inst->ik_count = 0;
+  std::memset(inst->layer_has_joint_weights, 0, sizeof(inst->layer_has_joint_weights));
 
   *out_inst = inst;
   return OZZ_OK;
@@ -187,10 +194,34 @@ void ozz_instance_deinit(ozz_instance_t* inst) {
 
 void ozz_instance_set_layers(ozz_instance_t* inst, const ozz_layer_desc_t* layers, int32_t count) {
   if (!inst) return;
-  if (!layers || count <= 0) { inst->layer_count = 0; return; }
+  if (!layers || count <= 0) { inst->layer_count = 0; std::memset(inst->layer_has_joint_weights, 0, sizeof(inst->layer_has_joint_weights)); return; }
   if (count > OZZ_MAX_LAYERS) count = OZZ_MAX_LAYERS;
   inst->layer_count = count;
-  for (int32_t i = 0; i < count; ++i) inst->layers[i] = layers[i];
+  for (int32_t i = 0; i < count; ++i) {
+    inst->layers[i] = layers[i];
+    inst->layer_has_joint_weights[i] = 0;
+
+    if (!layers[i].joint_weights || layers[i].joint_weights_count <= 0) {
+      inst->layers[i].joint_weights = nullptr;
+      inst->layers[i].joint_weights_count = 0;
+      continue;
+    }
+
+    ozz::math::SimdFloat4* dst = inst->layer_joint_weights + (size_t)i * (size_t)inst->num_soa;
+    for (int32_t soa = 0; soa < inst->num_soa; ++soa) {
+      const int32_t base = soa * 4;
+      const float x = base + 0 < layers[i].joint_weights_count ? layers[i].joint_weights[base + 0] : 0.f;
+      const float y = base + 1 < layers[i].joint_weights_count ? layers[i].joint_weights[base + 1] : 0.f;
+      const float z = base + 2 < layers[i].joint_weights_count ? layers[i].joint_weights[base + 2] : 0.f;
+      const float w = base + 3 < layers[i].joint_weights_count ? layers[i].joint_weights[base + 3] : 0.f;
+      dst[soa] = ozz::math::simd_float4::Load(x, y, z, w);
+    }
+
+    inst->layer_has_joint_weights[i] = 1;
+  }
+  for (int32_t i = count; i < OZZ_MAX_LAYERS; ++i) {
+    inst->layer_has_joint_weights[i] = 0;
+  }
 }
 
 void ozz_instance_set_ik_jobs(ozz_instance_t* inst, const ozz_ik_job_t* jobs, int32_t count) {
@@ -407,6 +438,9 @@ ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
 
       additive_layers[additive_count].transform = ozz::span<const ozz::math::SoaTransform>(dst, inst->num_soa);
       additive_layers[additive_count].weight = L.weight;
+      additive_layers[additive_count].joint_weights = inst->layer_has_joint_weights[i]
+          ? ozz::span<const ozz::math::SimdFloat4>(inst->layer_joint_weights + (size_t)i * (size_t)inst->num_soa, inst->num_soa)
+          : ozz::span<const ozz::math::SimdFloat4>();
       ++additive_count;
     } else {
       if (normal_count >= OZZ_MAX_LAYERS) continue;
@@ -416,6 +450,9 @@ ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
 
       normal_layers[normal_count].transform = ozz::span<const ozz::math::SoaTransform>(dst, inst->num_soa);
       normal_layers[normal_count].weight = L.weight;
+      normal_layers[normal_count].joint_weights = inst->layer_has_joint_weights[i]
+          ? ozz::span<const ozz::math::SimdFloat4>(inst->layer_joint_weights + (size_t)i * (size_t)inst->num_soa, inst->num_soa)
+          : ozz::span<const ozz::math::SimdFloat4>();
       ++normal_count;
     }
   }
@@ -539,6 +576,9 @@ ozz_result_t ozz_eval_model_3x4_reference(ozz_instance_t* inst, ozz_workspace_t*
       ozz::animation::BlendingJob::Layer layer;
       layer.transform = ozz::span<const ozz::math::SoaTransform>(sampled_additive.data() + offset, inst->num_soa);
       layer.weight = L.weight;
+      if (inst->layer_has_joint_weights[i]) {
+        layer.joint_weights = ozz::span<const ozz::math::SimdFloat4>(inst->layer_joint_weights + (size_t)i * (size_t)inst->num_soa, inst->num_soa);
+      }
       additive_layers.push_back(layer);
     } else {
       if ((int32_t)normal_layers.size() >= OZZ_MAX_LAYERS) continue;
@@ -550,6 +590,9 @@ ozz_result_t ozz_eval_model_3x4_reference(ozz_instance_t* inst, ozz_workspace_t*
       ozz::animation::BlendingJob::Layer layer;
       layer.transform = ozz::span<const ozz::math::SoaTransform>(sampled_normal.data() + offset, inst->num_soa);
       layer.weight = L.weight;
+      if (inst->layer_has_joint_weights[i]) {
+        layer.joint_weights = ozz::span<const ozz::math::SimdFloat4>(inst->layer_joint_weights + (size_t)i * (size_t)inst->num_soa, inst->num_soa);
+      }
       normal_layers.push_back(layer);
     }
   }

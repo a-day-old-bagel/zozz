@@ -39,6 +39,8 @@ typedef struct ozz_layer_desc_t {
   int wrap_time; // 0 clamp, !=0 wrap
   float weight;
   ozz_layer_mode_t mode;
+  const float* joint_weights;   // optional scalar weights, one per joint
+  int32_t joint_weights_count;  // expected to be >= skeleton joint count
 } ozz_layer_desc_t;
 
 typedef struct ozz_vec3_t { float x, y, z; } ozz_vec3_t;
