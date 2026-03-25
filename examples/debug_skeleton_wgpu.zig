@@ -8,7 +8,8 @@ const zozz = @import("zozz_runtime");
 
 const window_title = "zozz: debug skeleton (wgpu)";
 const target_marker_half_extent = 0.08;
-const extra_debug_vertices = 14;
+const extra_debug_vertices = 38;
+const joint_axis_extent = 0.12;
 
 // zig fmt: off
 const wgsl_vs =
@@ -58,6 +59,7 @@ const Controls = struct {
     enable_arm_ik: bool = true,
     orbit_camera: bool = true,
     show_target: bool = true,
+    show_joint_axes: bool = true,
     arm_weight: f32 = 0.85,
     arm_soften: f32 = 0.8,
     head_weight: f32 = 0.35,
@@ -67,8 +69,8 @@ const Controls = struct {
     target_sway: f32 = 0.10,
     target_bob: f32 = 0.08,
     elbow_axis: AxisChoice = .pos_z,
-    head_forward_axis: AxisChoice = .pos_x,
-    head_up_axis: AxisChoice = .pos_y,
+    head_forward_axis: AxisChoice = .pos_y,
+    head_up_axis: AxisChoice = .pos_x,
 };
 
 const InputState = struct {
@@ -78,6 +80,7 @@ const InputState = struct {
     toggle_head_aim: bool = false,
     toggle_target: bool = false,
     toggle_orbit_camera: bool = false,
+    toggle_joint_axes: bool = false,
     cycle_elbow_axis: bool = false,
     cycle_head_forward_axis: bool = false,
     cycle_head_up_axis: bool = false,
@@ -467,6 +470,45 @@ fn updateSkeletonVertices(demo: *DemoState, time_seconds: f32) !usize {
         }
     }
 
+    if (demo.controls.show_joint_axes) {
+        if (demo.head_joint >= 0) {
+            appendJointBasis(
+                demo.line_vertices,
+                &vertex_count,
+                palette,
+                @intCast(demo.head_joint),
+                joint_axis_extent,
+            );
+        }
+        if (demo.arm_chain.isValid()) {
+            appendJointBasis(
+                demo.line_vertices,
+                &vertex_count,
+                palette,
+                @intCast(demo.arm_chain.start_joint),
+                joint_axis_extent,
+            );
+        }
+        if (demo.arm_chain.isValid()) {
+            appendJointBasis(
+                demo.line_vertices,
+                &vertex_count,
+                palette,
+                @intCast(demo.arm_chain.mid_joint),
+                joint_axis_extent,
+            );
+        }
+        if (demo.arm_chain.isValid()) {
+            appendJointBasis(
+                demo.line_vertices,
+                &vertex_count,
+                palette,
+                @intCast(demo.arm_chain.end_joint),
+                joint_axis_extent,
+            );
+        }
+    }
+
     appendAxesOrigin(demo.line_vertices, &vertex_count);
 
     return vertex_count;
@@ -557,7 +599,7 @@ fn onOff(value: bool) []const u8 {
 fn printControls() void {
     std.debug.print(
         \\Controls:
-        \\  1 auto blend   2 additive   3 arm IK   4 head aim   5 target marker   6 orbit camera
+        \\  1 auto blend   2 additive   3 arm IK   4 head aim   5 target marker   6 orbit camera   7 joint axes
         \\  Q elbow axis   W head forward axis   E head up axis
         \\  A/D blend      S/F arm weight        G/H arm soften
         \\  X/C head weight
@@ -581,7 +623,7 @@ fn printResolvedJoints(demo: *const DemoState) void {
 
 fn printControlState(demo: *const DemoState) void {
     std.debug.print(
-        "State: blend={d:.2} auto={s} add={s} arm={s} head={s} target={s} orbit={s} arm_weight={d:.2} arm_soften={d:.2} head_weight={d:.2} target_forward={d:.2} target_lift={d:.2} elbow={s} head_forward={s} head_up={s}\n",
+        "State: blend={d:.2} auto={s} add={s} arm={s} head={s} target={s} axes={s} orbit={s} arm_weight={d:.2} arm_soften={d:.2} head_weight={d:.2} target_forward={d:.2} target_lift={d:.2} elbow={s} head_forward={s} head_up={s}\n",
         .{
             demo.controls.blend,
             onOff(demo.controls.auto_blend),
@@ -589,6 +631,7 @@ fn printControlState(demo: *const DemoState) void {
             onOff(demo.controls.enable_arm_ik),
             onOff(demo.controls.enable_head_aim),
             onOff(demo.controls.show_target),
+            onOff(demo.controls.show_joint_axes),
             onOff(demo.controls.orbit_camera),
             demo.controls.arm_weight,
             demo.controls.arm_soften,
@@ -635,6 +678,10 @@ fn handleInput(window: *zglfw.Window, demo: *DemoState) void {
     }
     if (consumeEdge(window, .six, &demo.input.toggle_orbit_camera)) {
         demo.controls.orbit_camera = !demo.controls.orbit_camera;
+        changed = true;
+    }
+    if (consumeEdge(window, .seven, &demo.input.toggle_joint_axes)) {
+        demo.controls.show_joint_axes = !demo.controls.show_joint_axes;
         changed = true;
     }
     if (consumeEdge(window, .q, &demo.input.cycle_elbow_axis)) {
@@ -695,7 +742,7 @@ fn updateWindowTitle(window: *zglfw.Window, demo: *const DemoState) void {
     var buffer: [256]u8 = undefined;
     const title = std.fmt.bufPrintZ(
         &buffer,
-        "{s} | blend {d:.2} | arm {s} {d:.2} | head {s} {d:.2} | add {s} | elbow {s}",
+        "{s} | blend {d:.2} | arm {s} {d:.2} | head {s} {d:.2} | add {s} | axes {s} | elbow {s}",
         .{
             window_title,
             demo.controls.blend,
@@ -704,6 +751,7 @@ fn updateWindowTitle(window: *zglfw.Window, demo: *const DemoState) void {
             onOff(demo.controls.enable_head_aim),
             demo.controls.head_weight,
             onOff(demo.controls.enable_additive),
+            onOff(demo.controls.show_joint_axes),
             axisChoiceLabel(demo.controls.elbow_axis),
         },
     ) catch return;
@@ -716,6 +764,15 @@ fn paletteTranslation(palette: []const f32, joint: usize) [3]f32 {
         palette[base + 9],
         palette[base + 10],
         palette[base + 11],
+    };
+}
+
+fn paletteAxis(palette: []const f32, joint: usize, axis: usize) [3]f32 {
+    const base = joint * 12 + axis * 3;
+    return .{
+        palette[base + 0],
+        palette[base + 1],
+        palette[base + 2],
     };
 }
 
@@ -759,6 +816,23 @@ fn appendAxesOrigin(vertices: []Vertex, vertex_count: *usize) void {
     appendLine(vertices, vertex_count, .{ 0, 0, 0 }, .{ 0, 0, 0.5 }, .{ 0, 0, 1 });
 }
 
+fn appendJointBasis(
+    vertices: []Vertex,
+    vertex_count: *usize,
+    palette: []const f32,
+    joint: usize,
+    axis_extent: f32,
+) void {
+    const origin = paletteTranslation(palette, joint);
+    const x_axis = paletteAxis(palette, joint, 0);
+    const y_axis = paletteAxis(palette, joint, 1);
+    const z_axis = paletteAxis(palette, joint, 2);
+
+    appendLine(vertices, vertex_count, origin, addScaled3(origin, x_axis, axis_extent), .{ 1.0, 0.25, 0.25 });
+    appendLine(vertices, vertex_count, origin, addScaled3(origin, y_axis, axis_extent), .{ 0.25, 1.0, 0.25 });
+    appendLine(vertices, vertex_count, origin, addScaled3(origin, z_axis, axis_extent), .{ 0.25, 0.55, 1.0 });
+}
+
 fn appendLine(vertices: []Vertex, vertex_count: *usize, a: [3]f32, b: [3]f32, color: [3]f32) void {
     vertices[vertex_count.* + 0] = .{ .position = a, .color = color };
     vertices[vertex_count.* + 1] = .{ .position = b, .color = color };
@@ -770,6 +844,14 @@ fn sub3(a: [3]f32, b: [3]f32) [3]f32 {
         a[0] - b[0],
         a[1] - b[1],
         a[2] - b[2],
+    };
+}
+
+fn addScaled3(a: [3]f32, b: [3]f32, scale: f32) [3]f32 {
+    return .{
+        a[0] + b[0] * scale,
+        a[1] + b[1] * scale,
+        a[2] + b[2] * scale,
     };
 }
 
