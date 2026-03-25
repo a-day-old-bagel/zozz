@@ -12,3 +12,5 @@ zig build debug-skeleton-run
 ```
 
 That sample lives in `examples/debug_skeleton_wgpu.zig` and uses the bundled `.ozz` assets under `assets/`.
+
+Runtime layer sampling uses upstream-style normalized phase through `Layer.atRatio(...)`.

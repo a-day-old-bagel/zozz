@@ -138,6 +138,8 @@ const DemoState = struct {
     input: InputState,
     current_target_ms: [3]f32,
     current_hand_distance: f32,
+    locomotion_phase: f32,
+    last_sample_time: ?f32,
 };
 
 fn init(allocator: std.mem.Allocator, window: *zglfw.Window) !DemoState {
@@ -279,6 +281,8 @@ fn init(allocator: std.mem.Allocator, window: *zglfw.Window) !DemoState {
         .input = .{},
         .current_target_ms = .{ 0.0, 1.2, -0.6 },
         .current_hand_distance = 0.0,
+        .locomotion_phase = 0.0,
+        .last_sample_time = null,
     };
 }
 
@@ -388,6 +392,19 @@ fn updateSkeletonVertices(demo: *DemoState, time_seconds: f32) !usize {
         0.5 + 0.5 * @sin(time_seconds * 0.35)
     else
         demo.controls.blend;
+    const dt = dt: {
+        const previous = demo.last_sample_time orelse {
+            demo.last_sample_time = time_seconds;
+            break :dt 0.0;
+        };
+        demo.last_sample_time = time_seconds;
+        break :dt @max(0.0, time_seconds - previous);
+    };
+    const walk_frequency = 1.0 / @max(demo.walk.duration(), 1e-5);
+    const run_frequency = 1.0 / @max(demo.run.duration(), 1e-5);
+    const locomotion_frequency = walk_frequency + (run_frequency - walk_frequency) * blend;
+    demo.locomotion_phase = @mod(demo.locomotion_phase + dt * locomotion_frequency, 1.0);
+    const locomotion_phase = demo.locomotion_phase;
     const curl_weight = if (demo.controls.enable_additive)
         0.15 + 0.15 * (0.5 + 0.5 * @sin(time_seconds * 1.1))
     else
@@ -398,10 +415,10 @@ fn updateSkeletonVertices(demo: *DemoState, time_seconds: f32) !usize {
         0.0;
 
     demo.inst.setLayers(&[_]zozz.Layer{
-        .{ .anim = demo.walk, .time_seconds = time_seconds, .wrap_time = true, .weight = 1.0 - blend, .mode = .normal },
-        .{ .anim = demo.run, .time_seconds = time_seconds * 1.15, .wrap_time = true, .weight = blend, .mode = .normal },
-        .{ .anim = demo.curl, .time_seconds = 0.0, .wrap_time = true, .weight = curl_weight, .mode = .additive },
-        .{ .anim = demo.splay, .time_seconds = 0.0, .wrap_time = true, .weight = splay_weight, .mode = .additive },
+        zozz.Layer.atRatio(demo.walk, locomotion_phase, 1.0 - blend, .normal),
+        zozz.Layer.atRatio(demo.run, locomotion_phase, blend, .normal),
+        zozz.Layer.atRatio(demo.curl, 0.0, curl_weight, .additive),
+        zozz.Layer.atRatio(demo.splay, 0.0, splay_weight, .additive),
     });
     demo.inst.setIkJobs(&.{});
 

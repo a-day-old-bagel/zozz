@@ -6,6 +6,7 @@
 #include <new>
 #include <cstring>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 #include "ozz/animation/runtime/skeleton.h"
@@ -19,6 +20,7 @@
 
 #include "ozz/base/io/archive.h"
 #include "ozz/base/io/stream.h"
+#include "ozz/base/memory/allocator.h"
 #include "ozz/base/maths/soa_transform.h"
 #include "ozz/base/maths/soa_float4x4.h"
 #include "ozz/base/maths/simd_math.h"
@@ -62,8 +64,85 @@ static inline T* bump_alloc(void*& cursor, size_t& left, size_t count = 1) {
   left = (size_t)(end - (cur + bytes));
   return (T*)aligned;
 }
+static inline void* bump_alloc_bytes(void*& cursor, size_t& left, size_t bytes, size_t align) {
+  void* aligned = align_up_ptr(cursor, align);
+  uintptr_t cur = (uintptr_t)aligned;
+  uintptr_t end = (uintptr_t)cursor + left;
+  if (cur + bytes > end) return nullptr;
+  cursor = (void*)(cur + bytes);
+  left = (size_t)(end - (cur + bytes));
+  return aligned;
+}
 
 static inline int32_t num_soa_from_joints(int32_t n) { return (n + 3) / 4; }
+
+namespace {
+struct SamplingContextInterpSoaFloat3 {
+  ozz::math::SimdFloat4 ratio[2];
+  ozz::math::SoaFloat3 value[2];
+};
+
+struct SamplingContextInterpSoaQuaternion {
+  ozz::math::SimdFloat4 ratio[2];
+  ozz::math::SoaQuaternion value[2];
+};
+
+static size_t sampling_context_required_bytes(int32_t num_joints) {
+  const size_t max_soa_tracks = (size_t)num_soa_from_joints(num_joints);
+  const size_t max_tracks = max_soa_tracks * 4;
+  const size_t num_outdated = (max_soa_tracks + 7) / 8;
+  return sizeof(SamplingContextInterpSoaFloat3) * max_soa_tracks +
+      sizeof(SamplingContextInterpSoaQuaternion) * max_soa_tracks +
+      sizeof(SamplingContextInterpSoaFloat3) * max_soa_tracks +
+      sizeof(uint32_t) * max_tracks * 3 +
+      sizeof(uint8_t) * 3 * num_outdated;
+}
+
+static constexpr size_t kSamplingContextAlignment = alignof(SamplingContextInterpSoaFloat3);
+
+class FixedBlockAllocator final : public ozz::memory::Allocator {
+ public:
+  FixedBlockAllocator(void* block, size_t block_size)
+      : block_(static_cast<unsigned char*>(block)), block_size_(block_size) {}
+
+  void* Allocate(size_t size, size_t alignment) override {
+    if (used_) return nullptr;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(block_);
+    const uintptr_t aligned = align_up_uintptr(base, alignment);
+    const size_t padding = (size_t)(aligned - base);
+    if (padding + size > block_size_) return nullptr;
+    used_ = true;
+    allocation_ = reinterpret_cast<void*>(aligned);
+    return allocation_;
+  }
+
+  void Deallocate(void* block) override {
+    if (!block || block == allocation_) return;
+  }
+
+  bool used_block() const { return used_; }
+
+ private:
+  unsigned char* block_ = nullptr;
+  size_t block_size_ = 0;
+  void* allocation_ = nullptr;
+  bool used_ = false;
+};
+
+static std::mutex g_ozz_allocator_mutex;
+
+template <typename Fn>
+static auto with_temporary_ozz_allocator(ozz::memory::Allocator* allocator, Fn&& fn)
+    -> decltype(fn()) {
+  std::lock_guard<std::mutex> lock(g_ozz_allocator_mutex);
+  ozz::memory::Allocator* previous = ozz::memory::SetDefaulAllocator(allocator);
+  struct RestoreAllocator {
+    ozz::memory::Allocator* previous;
+    ~RestoreAllocator() { ozz::memory::SetDefaulAllocator(previous); }
+  } restore{previous};
+  return fn();
+}
+}  // namespace
 
 template <typename T>
 static ozz_result_t load_ozz_object_from_file(const char* path, T* out_obj) {
@@ -130,6 +209,8 @@ struct ozz_instance_t {
   int32_t num_soa;
 
   ozz::animation::SamplingJob::Context sampling_ctx;
+  void* sampling_ctx_mem;
+  size_t sampling_ctx_mem_bytes;
 
   ozz::math::SoaTransform* accum; // persistent pose (SoA)
   ozz::math::SimdFloat4* layer_joint_weights; // [OZZ_MAX_LAYERS * num_soa]
@@ -162,6 +243,7 @@ size_t ozz_instance_required_bytes(const ozz_skeleton_t* skel_h) {
   auto bump = [&](size_t sz, size_t al) { bytes = (bytes + (al - 1)) & ~(al - 1); bytes += sz; };
 
   bump(sizeof(ozz_instance_t), alignof(ozz_instance_t));
+  bump(sampling_context_required_bytes(n), kSamplingContextAlignment);
   bump(sizeof(ozz::math::SoaTransform) * (size_t)ns, alignof(ozz::math::SoaTransform));
   bump(sizeof(ozz::math::SimdFloat4) * (size_t)(ns * OZZ_MAX_LAYERS), alignof(ozz::math::SimdFloat4));
   return bytes;
@@ -181,13 +263,33 @@ ozz_result_t ozz_instance_init(void* mem, size_t mem_bytes, const ozz_skeleton_t
   inst->skel = &skel_h->skel;
   inst->num_joints = (int32_t)skel_h->skel.num_joints();
   inst->num_soa = num_soa_from_joints(inst->num_joints);
-  inst->sampling_ctx.Resize(inst->num_joints);
+  inst->sampling_ctx_mem_bytes = sampling_context_required_bytes(inst->num_joints);
+  inst->sampling_ctx_mem = bump_alloc_bytes(cur, left, inst->sampling_ctx_mem_bytes, kSamplingContextAlignment);
+  if (!inst->sampling_ctx_mem) {
+    inst->~ozz_instance_t();
+    return set_err(OZZ_ERR_INVALID_ARGUMENT, "mem too small (sampling_ctx)");
+  }
+
+  FixedBlockAllocator sampling_ctx_allocator(inst->sampling_ctx_mem, inst->sampling_ctx_mem_bytes);
+  with_temporary_ozz_allocator(&sampling_ctx_allocator, [&]() {
+    inst->sampling_ctx.Resize(inst->num_joints);
+  });
+  if (!sampling_ctx_allocator.used_block()) {
+    inst->~ozz_instance_t();
+    return set_err(OZZ_ERR, "sampling context allocation failed");
+  }
 
   inst->accum = bump_alloc<ozz::math::SoaTransform>(cur, left, (size_t)inst->num_soa);
-  if (!inst->accum) return set_err(OZZ_ERR_INVALID_ARGUMENT, "mem too small (accum)");
+  if (!inst->accum) {
+    ozz_instance_deinit(inst);
+    return set_err(OZZ_ERR_INVALID_ARGUMENT, "mem too small (accum)");
+  }
 
   inst->layer_joint_weights = bump_alloc<ozz::math::SimdFloat4>(cur, left, (size_t)(inst->num_soa * OZZ_MAX_LAYERS));
-  if (!inst->layer_joint_weights) return set_err(OZZ_ERR_INVALID_ARGUMENT, "mem too small (layer_joint_weights)");
+  if (!inst->layer_joint_weights) {
+    ozz_instance_deinit(inst);
+    return set_err(OZZ_ERR_INVALID_ARGUMENT, "mem too small (layer_joint_weights)");
+  }
 
   inst->layer_count = 0;
   inst->ik_count = 0;
@@ -199,7 +301,10 @@ ozz_result_t ozz_instance_init(void* mem, size_t mem_bytes, const ozz_skeleton_t
 
 void ozz_instance_deinit(ozz_instance_t* inst) {
   if (!inst) return;
-  inst->~ozz_instance_t(); // frees SamplingJob::Context internal allocations
+  FixedBlockAllocator sampling_ctx_allocator(inst->sampling_ctx_mem, inst->sampling_ctx_mem_bytes);
+  with_temporary_ozz_allocator(&sampling_ctx_allocator, [&]() {
+    inst->~ozz_instance_t();
+  });
 }
 
 void ozz_instance_set_layers(ozz_instance_t* inst, const ozz_layer_desc_t* layers, int32_t count) {
@@ -298,16 +403,8 @@ const float* ozz_workspace_palette_3x4(const ozz_workspace_t* ws) { return ws ? 
 int32_t ozz_workspace_palette_floats(const ozz_workspace_t* ws) { return ws ? (12 * ws->num_joints) : 0; }
 
 // ---- helpers ----
-static inline float wrap_or_clamp(float t, float dur, int wrap) {
-  if (dur <= 0.0f) return 0.0f;
-  if (wrap) {
-    t = std::fmod(t, dur);
-    if (t < 0.0f) t += dur;
-    return t;
-  }
-  if (t < 0.0f) return 0.0f;
-  if (t > dur) return dur;
-  return t;
+static inline bool ratio_is_valid(float ratio) {
+  return std::isfinite(ratio) && ratio >= 0.0f && ratio <= 1.0f;
 }
 
 // Store packed column-major 3x4 (12 floats) from Float4x4 columns.
@@ -325,15 +422,11 @@ static inline ozz::math::SimdFloat4 load3(float x, float y, float z, float w) {
 
 static inline ozz_result_t sample_into(ozz_instance_t* inst,
                                        const ozz_animation_t* anim_h,
-                                       float time_s,
-                                       int wrap,
+                                       float ratio,
                                        ozz::math::SoaTransform* out) {
   if (!anim_h) return OZZ_ERR_INVALID_ARGUMENT;
   if ((int32_t)anim_h->anim.num_tracks() != inst->num_joints) return OZZ_ERR_INVALID_ARGUMENT;
-
-  const float dur = anim_h->anim.duration();
-  const float t = wrap_or_clamp(time_s, dur, wrap);
-  const float ratio = (dur > 0.0f) ? (t / dur) : 0.0f;
+  if (!ratio_is_valid(ratio)) return OZZ_ERR_INVALID_ARGUMENT;
 
   ozz::animation::SamplingJob job;
   job.animation = &anim_h->anim;
@@ -348,15 +441,11 @@ static inline ozz_result_t sample_into_context(int32_t num_joints,
                                                int32_t num_soa,
                                                ozz::animation::SamplingJob::Context* ctx,
                                                const ozz_animation_t* anim_h,
-                                               float time_s,
-                                               int wrap,
+                                               float ratio,
                                                ozz::math::SoaTransform* out) {
   if (!ctx || !anim_h) return OZZ_ERR_INVALID_ARGUMENT;
   if ((int32_t)anim_h->anim.num_tracks() != num_joints) return OZZ_ERR_INVALID_ARGUMENT;
-
-  const float dur = anim_h->anim.duration();
-  const float t = wrap_or_clamp(time_s, dur, wrap);
-  const float ratio = (dur > 0.0f) ? (t / dur) : 0.0f;
+  if (!ratio_is_valid(ratio)) return OZZ_ERR_INVALID_ARGUMENT;
 
   ozz::animation::SamplingJob job;
   job.animation = &anim_h->anim;
@@ -444,7 +533,7 @@ ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
     if (L.mode == OZZ_LAYER_ADDITIVE) {
       if (additive_count >= OZZ_MAX_LAYERS) continue;
       ozz::math::SoaTransform* dst = ws->sampled_additive + (size_t)additive_count * (size_t)inst->num_soa;
-      ozz_result_t r = sample_into(inst, L.anim, L.time_seconds, L.wrap_time, dst);
+      ozz_result_t r = sample_into(inst, L.anim, L.ratio, dst);
       if (r != OZZ_OK) return set_err(r, "sample failed");
 
       additive_layers[additive_count].transform = ozz::span<const ozz::math::SoaTransform>(dst, inst->num_soa);
@@ -456,7 +545,7 @@ ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
     } else {
       if (normal_count >= OZZ_MAX_LAYERS) continue;
       ozz::math::SoaTransform* dst = ws->sampled_normal + (size_t)normal_count * (size_t)inst->num_soa;
-      ozz_result_t r = sample_into(inst, L.anim, L.time_seconds, L.wrap_time, dst);
+      ozz_result_t r = sample_into(inst, L.anim, L.ratio, dst);
       if (r != OZZ_OK) return set_err(r, "sample failed");
 
       normal_layers[normal_count].transform = ozz::span<const ozz::math::SoaTransform>(dst, inst->num_soa);
@@ -564,7 +653,7 @@ ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
   return OZZ_OK;
 }
 
-ozz_result_t ozz_eval_model_3x4_reference(ozz_instance_t* inst, ozz_workspace_t* ws) {
+extern "C" ozz_result_t ozz_eval_model_3x4_reference(ozz_instance_t* inst, ozz_workspace_t* ws) {
   ozz_clear_error();
   if (!inst || !ws) return set_err(OZZ_ERR_INVALID_ARGUMENT, "null inst/ws");
   if (inst->skel != ws->skel) return set_err(OZZ_ERR_INVALID_ARGUMENT, "skeleton mismatch");
@@ -590,7 +679,7 @@ ozz_result_t ozz_eval_model_3x4_reference(ozz_instance_t* inst, ozz_workspace_t*
       if ((int32_t)additive_layers.size() >= OZZ_MAX_LAYERS) continue;
       const size_t offset = sampled_additive.size();
       sampled_additive.resize(offset + (size_t)inst->num_soa);
-      ozz_result_t r = sample_into_context(inst->num_joints, inst->num_soa, &sampling_ctx, L.anim, L.time_seconds, L.wrap_time, sampled_additive.data() + offset);
+      ozz_result_t r = sample_into_context(inst->num_joints, inst->num_soa, &sampling_ctx, L.anim, L.ratio, sampled_additive.data() + offset);
       if (r != OZZ_OK) return set_err(r, "reference sample failed");
 
       ozz::animation::BlendingJob::Layer layer;
@@ -604,7 +693,7 @@ ozz_result_t ozz_eval_model_3x4_reference(ozz_instance_t* inst, ozz_workspace_t*
       if ((int32_t)normal_layers.size() >= OZZ_MAX_LAYERS) continue;
       const size_t offset = sampled_normal.size();
       sampled_normal.resize(offset + (size_t)inst->num_soa);
-      ozz_result_t r = sample_into_context(inst->num_joints, inst->num_soa, &sampling_ctx, L.anim, L.time_seconds, L.wrap_time, sampled_normal.data() + offset);
+      ozz_result_t r = sample_into_context(inst->num_joints, inst->num_soa, &sampling_ctx, L.anim, L.ratio, sampled_normal.data() + offset);
       if (r != OZZ_OK) return set_err(r, "reference sample failed");
 
       ozz::animation::BlendingJob::Layer layer;

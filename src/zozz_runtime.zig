@@ -97,6 +97,10 @@ pub const Animation = struct {
     pub fn duration(self: Animation) f32 {
         return c.ozz_animation_duration(self.handle);
     }
+
+    pub fn timeFromRatio(self: Animation, ratio: f32) f32 {
+        return ratio * self.duration();
+    }
 };
 
 pub const Vec3 = extern struct {
@@ -209,11 +213,20 @@ pub const LayerMode = enum(u32) {
 
 pub const Layer = struct {
     anim: Animation,
-    time_seconds: f32,
-    wrap_time: bool = true,
+    ratio: f32,
     weight: f32,
     mode: LayerMode = .normal,
     joint_weights: ?[]const f32 = null,
+
+    pub fn atRatio(anim: Animation, sample_ratio: f32, weight: f32, mode: LayerMode) Layer {
+        return .{
+            .anim = anim,
+            .ratio = sample_ratio,
+            .weight = weight,
+            .mode = mode,
+            .joint_weights = null,
+        };
+    }
 };
 
 // --------------------
@@ -250,8 +263,7 @@ pub const Instance = struct {
         for (layers, 0..) |L, i| {
             tmp[i] = .{
                 .anim = L.anim.handle,
-                .time_seconds = L.time_seconds,
-                .wrap_time = @intFromBool(L.wrap_time),
+                .ratio = L.ratio,
                 .weight = L.weight,
                 .mode = @intCast(@intFromEnum(L.mode)),
                 .joint_weights = if (L.joint_weights) |weights| weights.ptr else null,
@@ -336,8 +348,10 @@ pub fn evalModel3x4(inst: *Instance, ws: *Workspace) ![]const f32 {
     return ws.palette3x4();
 }
 
-pub fn evalModel3x4Reference(inst: *Instance, ws: *Workspace) ![]const f32 {
-    try mapResult(c.ozz_eval_model_3x4_reference(inst.handle, ws.handle));
+extern fn ozz_eval_model_3x4_reference(inst: *c.ozz_instance_t, ws: *c.ozz_workspace_t) c.ozz_result_t;
+
+fn evalModel3x4Reference(inst: *Instance, ws: *Workspace) ![]const f32 {
+    try mapResult(ozz_eval_model_3x4_reference(inst.handle, ws.handle));
     return ws.palette3x4();
 }
 
@@ -413,8 +427,8 @@ test "ozz C ABI wrapper: load + 2-clip blend + 3x4 palette is sane" {
     defer ws.deinit(A);
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = jog, .time_seconds = 0.10, .wrap_time = true, .weight = 0.35, .mode = .normal },
-        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 0.65, .mode = .normal },
+        .{ .anim = jog, .ratio = 0.10, .weight = 0.35, .mode = .normal },
+        .{ .anim = walk, .ratio = 0.10, .weight = 0.65, .mode = .normal },
     });
 
     const palette = try evalModel3x4(&inst, &ws);
@@ -462,6 +476,17 @@ test "skeleton joint parent queries are structurally sane" {
     try std.testing.expect(root_count >= 1);
 }
 
+test "ratio helper converts normalized phase to animation seconds" {
+    var walk = try Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
+    defer walk.deinit();
+
+    const duration = walk.duration();
+    try std.testing.expectApproxEqAbs(duration * 0.25, walk.timeFromRatio(0.25), 1e-6);
+
+    const layer = Layer.atRatio(walk, 0.25, 1.0, .normal);
+    try std.testing.expectApproxEqAbs(0.25, layer.ratio, 1e-6);
+}
+
 test "evalModel3x4 matches upstream reference for a single normal clip" {
     const A = std.testing.allocator;
 
@@ -481,7 +506,7 @@ test "evalModel3x4 matches upstream reference for a single normal clip" {
     defer ws_reference.deinit(A);
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
     });
 
     const actual = try copyPalette(A, try evalModel3x4(&inst, &ws_actual));
@@ -516,9 +541,9 @@ test "evalModel3x4 matches upstream reference for mixed normal layers" {
     defer ws_reference.deinit(A);
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = jog, .time_seconds = 0.10, .wrap_time = true, .weight = 0.20, .mode = .normal },
-        .{ .anim = walk, .time_seconds = 0.25, .wrap_time = true, .weight = 0.35, .mode = .normal },
-        .{ .anim = run, .time_seconds = 0.40, .wrap_time = true, .weight = 0.45, .mode = .normal },
+        .{ .anim = jog, .ratio = 0.10, .weight = 0.20, .mode = .normal },
+        .{ .anim = walk, .ratio = 0.25, .weight = 0.35, .mode = .normal },
+        .{ .anim = run, .ratio = 0.40, .weight = 0.45, .mode = .normal },
     });
 
     const actual = try copyPalette(A, try evalModel3x4(&inst, &ws_actual));
@@ -553,9 +578,9 @@ test "evalModel3x4 matches upstream reference for additive hand poses" {
     defer ws_reference.deinit(A);
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
-        .{ .anim = curl, .time_seconds = 0.0, .wrap_time = true, .weight = 0.30, .mode = .additive },
-        .{ .anim = splay, .time_seconds = 0.0, .wrap_time = true, .weight = 0.90, .mode = .additive },
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+        .{ .anim = curl, .ratio = 0.0, .weight = 0.30, .mode = .additive },
+        .{ .anim = splay, .ratio = 0.0, .weight = 0.90, .mode = .additive },
     });
 
     const actual = try copyPalette(A, try evalModel3x4(&inst, &ws_actual));
@@ -587,8 +612,8 @@ test "evalModel3x4 matches upstream reference for negative additive weights" {
     defer ws_reference.deinit(A);
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
-        .{ .anim = curl, .time_seconds = 0.0, .wrap_time = true, .weight = -0.50, .mode = .additive },
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+        .{ .anim = curl, .ratio = 0.0, .weight = -0.50, .mode = .additive },
     });
 
     const actual = try copyPalette(A, try evalModel3x4(&inst, &ws_actual));
@@ -629,28 +654,28 @@ test "partial normal layer masks obey zero and one semantics" {
     @memset(one_mask, 1);
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
     });
     const base = try copyPalette(A, try evalModel3x4(&inst, &ws_a));
     defer A.free(base);
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
-        .{ .anim = jog, .time_seconds = 0.25, .wrap_time = true, .weight = 0.5, .mode = .normal, .joint_weights = zero_mask },
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+        .{ .anim = jog, .ratio = 0.25, .weight = 0.5, .mode = .normal, .joint_weights = zero_mask },
     });
     const zeroed = try evalModel3x4(&inst, &ws_b);
     try expectSlicesApproxEqAbs(base, zeroed, 1e-4);
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
-        .{ .anim = jog, .time_seconds = 0.25, .wrap_time = true, .weight = 0.5, .mode = .normal },
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+        .{ .anim = jog, .ratio = 0.25, .weight = 0.5, .mode = .normal },
     });
     const unmasked = try copyPalette(A, try evalModel3x4(&inst, &ws_a));
     defer A.free(unmasked);
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
-        .{ .anim = jog, .time_seconds = 0.25, .wrap_time = true, .weight = 0.5, .mode = .normal, .joint_weights = one_mask },
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+        .{ .anim = jog, .ratio = 0.25, .weight = 0.5, .mode = .normal, .joint_weights = one_mask },
     });
     const ones = try evalModel3x4(&inst, &ws_b);
     try expectSlicesApproxEqAbs(unmasked, ones, 1e-4);
@@ -687,28 +712,28 @@ test "partial additive layer masks obey zero and one semantics" {
     @memset(one_mask, 1);
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
     });
     const base = try copyPalette(A, try evalModel3x4(&inst, &ws_a));
     defer A.free(base);
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
-        .{ .anim = curl, .time_seconds = 0.0, .wrap_time = true, .weight = 0.6, .mode = .additive, .joint_weights = zero_mask },
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+        .{ .anim = curl, .ratio = 0.0, .weight = 0.6, .mode = .additive, .joint_weights = zero_mask },
     });
     const zeroed = try evalModel3x4(&inst, &ws_b);
     try expectSlicesApproxEqAbs(base, zeroed, 1e-4);
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
-        .{ .anim = curl, .time_seconds = 0.0, .wrap_time = true, .weight = 0.6, .mode = .additive },
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+        .{ .anim = curl, .ratio = 0.0, .weight = 0.6, .mode = .additive },
     });
     const unmasked = try copyPalette(A, try evalModel3x4(&inst, &ws_a));
     defer A.free(unmasked);
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
-        .{ .anim = curl, .time_seconds = 0.0, .wrap_time = true, .weight = 0.6, .mode = .additive, .joint_weights = one_mask },
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+        .{ .anim = curl, .ratio = 0.0, .weight = 0.6, .mode = .additive, .joint_weights = one_mask },
     });
     const ones = try evalModel3x4(&inst, &ws_b);
     try expectSlicesApproxEqAbs(unmasked, ones, 1e-4);
@@ -748,8 +773,8 @@ test "partial normal blend with sparse mask matches upstream reference" {
     }
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
-        .{ .anim = run, .time_seconds = 0.30, .wrap_time = true, .weight = 0.7, .mode = .normal, .joint_weights = mask },
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+        .{ .anim = run, .ratio = 0.30, .weight = 0.7, .mode = .normal, .joint_weights = mask },
     });
 
     const actual = try copyPalette(A, try evalModel3x4(&inst, &ws_actual));
@@ -759,7 +784,7 @@ test "partial normal blend with sparse mask matches upstream reference" {
     try expectSlicesApproxEqAbs(reference, actual, 1e-4);
 }
 
-test "wrap_time=true matches wrapped sample and wrap_time=false clamps" {
+test "sampling rejects out-of-range ratios" {
     const A = std.testing.allocator;
 
     var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
@@ -774,34 +799,15 @@ test "wrap_time=true matches wrapped sample and wrap_time=false clamps" {
     var ws_a = try Workspace.init(A, skel);
     defer ws_a.deinit(A);
 
-    var ws_b = try Workspace.init(A, skel);
-    defer ws_b.deinit(A);
-
-    const dur = walk.duration();
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .ratio = -0.1, .weight = 1.0, .mode = .normal },
+    });
+    try std.testing.expectError(OzzError.InvalidArgument, evalModel3x4(&inst, &ws_a));
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
+        .{ .anim = walk, .ratio = 1.1, .weight = 1.0, .mode = .normal },
     });
-    const wrapped_base = try copyPalette(A, try evalModel3x4(&inst, &ws_a));
-    defer A.free(wrapped_base);
-
-    inst.setLayers(&[_]Layer{
-        .{ .anim = walk, .time_seconds = dur + 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
-    });
-    const wrapped_overflow = try evalModel3x4(&inst, &ws_b);
-    try expectSlicesApproxEqAbs(wrapped_base, wrapped_overflow, 1e-4);
-
-    inst.setLayers(&[_]Layer{
-        .{ .anim = walk, .time_seconds = dur, .wrap_time = false, .weight = 1.0, .mode = .normal },
-    });
-    const clamped_end = try copyPalette(A, try evalModel3x4(&inst, &ws_a));
-    defer A.free(clamped_end);
-
-    inst.setLayers(&[_]Layer{
-        .{ .anim = walk, .time_seconds = dur + 0.10, .wrap_time = false, .weight = 1.0, .mode = .normal },
-    });
-    const clamped_overflow = try evalModel3x4(&inst, &ws_b);
-    try expectSlicesApproxEqAbs(clamped_end, clamped_overflow, 1e-4);
+    try std.testing.expectError(OzzError.InvalidArgument, evalModel3x4(&inst, &ws_a));
 }
 
 test "aim IK matches upstream reference and changes the pose" {
@@ -829,7 +835,7 @@ test "aim IK matches upstream reference and changes the pose" {
     defer ws_reference.deinit(A);
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
     });
     inst.setIkJobs(&.{});
 
@@ -887,7 +893,7 @@ test "two-bone IK matches upstream reference and changes the pose" {
     defer ws_reference.deinit(A);
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
     });
     inst.setIkJobs(&.{});
 

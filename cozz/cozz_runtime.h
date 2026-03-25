@@ -35,8 +35,7 @@ typedef enum ozz_layer_mode_t {
 
 typedef struct ozz_layer_desc_t {
   const ozz_animation_t* anim;
-  float time_seconds;
-  int wrap_time; // 0 clamp, !=0 wrap
+  float ratio; // normalized sample ratio in [0, 1]
   float weight;
   ozz_layer_mode_t mode;
   const float* joint_weights;   // optional scalar weights, one per joint
@@ -101,10 +100,6 @@ void ozz_workspace_deinit(ozz_workspace_t* ws);
 // Evaluate: writes palette into workspace
 // Palette format: float[12*num_joints], column-major 3x4 per joint.
 ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws);
-
-// Validation/reference path used by tests to compare wrapper output against
-// direct upstream ozz jobs. Writes the same palette format as ozz_eval_model_3x4.
-ozz_result_t ozz_eval_model_3x4_reference(ozz_instance_t* inst, ozz_workspace_t* ws);
 
 // Access palette from workspace (valid until next eval on that workspace)
 const float* ozz_workspace_palette_3x4(const ozz_workspace_t* ws);
