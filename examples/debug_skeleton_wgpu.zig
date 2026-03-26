@@ -52,9 +52,9 @@ const AxisChoice = enum(u8) {
 };
 
 const Controls = struct {
-    auto_blend: bool = false,
+    auto_blend: bool = true,
     blend: f32 = 0.0,
-    enable_additive: bool = false,
+    enable_additive: bool = true,
     enable_head_aim: bool = true,
     enable_arm_ik: bool = true,
     orbit_camera: bool = true,
@@ -64,12 +64,12 @@ const Controls = struct {
     arm_soften: f32 = 0.60,
     head_weight: f32 = 0.75,
     target_side: f32 = 0.08,
-    target_lift: f32 = 0.15,
-    target_forward: f32 = 0.15,
+    target_lift: f32 = 0.25,
+    target_forward: f32 = 0.25,
     target_sway: f32 = 0.10,
     target_bob: f32 = 0.08,
     elbow_axis: AxisChoice = .pos_z,
-    arm_pole_axis: AxisChoice = .neg_z,
+    arm_pole_axis: AxisChoice = .neg_y,
     head_forward_axis: AxisChoice = .pos_y,
     head_up_axis: AxisChoice = .pos_x,
 };
@@ -313,11 +313,11 @@ fn draw(demo: *DemoState) !void {
     }
 
     const orbit = if (demo.controls.orbit_camera) 0.25 * t else 0.0;
-    const eye = zm.f32x4(4.2 * @sin(orbit), 1.6, -4.2 * @cos(orbit), 1.0);
+    const eye = zm.f32x4(3.2 * @sin(orbit), 1.6, -3.2 * @cos(orbit), 1.0);
     const target = zm.f32x4(0.0, 1.0, 0.0, 1.0);
     const up = zm.f32x4(0.0, 1.0, 0.0, 0.0);
-    const world_to_view = zm.lookAtLh(eye, target, up);
-    const view_to_clip = zm.perspectiveFovLh(
+    const world_to_view = zm.lookAtRh(eye, target, up);
+    const view_to_clip = zm.perspectiveFovRh(
         0.25 * math.pi,
         @as(f32, @floatFromInt(fb_width)) / @as(f32, @floatFromInt(fb_height)),
         0.01,
@@ -405,14 +405,9 @@ fn updateSkeletonVertices(demo: *DemoState, time_seconds: f32) !usize {
     const locomotion_frequency = walk_frequency + (run_frequency - walk_frequency) * blend;
     demo.locomotion_phase = @mod(demo.locomotion_phase + dt * locomotion_frequency, 1.0);
     const locomotion_phase = demo.locomotion_phase;
-    const curl_weight = if (demo.controls.enable_additive)
-        0.15 + 0.15 * (0.5 + 0.5 * @sin(time_seconds * 1.1))
-    else
-        0.0;
-    const splay_weight = if (demo.controls.enable_additive)
-        0.10 + 0.20 * (0.5 + 0.5 * @cos(time_seconds * 0.9))
-    else
-        0.0;
+
+    const curl_weight = if (demo.controls.enable_additive) @max(0.0, @sin(time_seconds) - 0.5) * 2.0 else 0.0;
+    const splay_weight = if (demo.controls.enable_additive) @min(0.0, @sin(-time_seconds) - 0.5) * 2.0 else 0.0;
 
     demo.inst.setLayers(&[_]zozz.Layer{
         zozz.Layer.atRatio(demo.walk, locomotion_phase, 1.0 - blend, .normal),
@@ -545,7 +540,7 @@ fn resolveArmChain(skeleton: zozz.Skeleton) ArmChain {
         .side_label = "Left",
         .start_joint = skeleton.findJointZ("LeftArm"),
         .mid_joint = skeleton.findJointZ("LeftForeArm"),
-        .end_joint = skeleton.findJointZ("LeftHand"),
+        .end_joint = skeleton.findJointZ("LeftHandMiddle3"),
     };
     if (left.isValid()) return left;
 
@@ -553,7 +548,7 @@ fn resolveArmChain(skeleton: zozz.Skeleton) ArmChain {
         .side_label = "Right",
         .start_joint = skeleton.findJointZ("RightArm"),
         .mid_joint = skeleton.findJointZ("RightForeArm"),
-        .end_joint = skeleton.findJointZ("RightHand"),
+        .end_joint = skeleton.findJointZ("RightHandMiddle3"),
     };
     if (right.isValid()) return right;
 
@@ -939,7 +934,6 @@ pub fn main() !void {
 
     const window = try zglfw.createWindow(1400, 900, window_title, null);
     defer window.destroy();
-    window.setSizeLimits(640, 480, -1, -1);
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
