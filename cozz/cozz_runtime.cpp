@@ -87,6 +87,34 @@ struct SamplingContextInterpSoaQuaternion {
   ozz::math::SoaQuaternion value[2];
 };
 
+class CallbackAllocator final : public ozz::memory::Allocator {
+ public:
+  void configure(void* user_data, ozz_alloc_fn alloc_fn, ozz_dealloc_fn dealloc_fn) {
+    user_data_ = user_data;
+    alloc_fn_ = alloc_fn;
+    dealloc_fn_ = dealloc_fn;
+  }
+
+  void clear() {
+    user_data_ = nullptr;
+    alloc_fn_ = nullptr;
+    dealloc_fn_ = nullptr;
+  }
+
+  void* Allocate(size_t size, size_t alignment) override {
+    return alloc_fn_ ? alloc_fn_(user_data_, size, alignment) : nullptr;
+  }
+
+  void Deallocate(void* block) override {
+    if (dealloc_fn_) dealloc_fn_(user_data_, block);
+  }
+
+ private:
+  void* user_data_ = nullptr;
+  ozz_alloc_fn alloc_fn_ = nullptr;
+  ozz_dealloc_fn dealloc_fn_ = nullptr;
+};
+
 static size_t sampling_context_required_bytes(int32_t num_joints) {
   const size_t max_soa_tracks = (size_t)num_soa_from_joints(num_joints);
   const size_t max_tracks = max_soa_tracks * 4;
@@ -130,6 +158,8 @@ class FixedBlockAllocator final : public ozz::memory::Allocator {
 };
 
 static std::mutex g_ozz_allocator_mutex;
+static CallbackAllocator g_callback_allocator;
+static ozz::memory::Allocator* g_base_ozz_allocator = nullptr;
 
 template <typename Fn>
 static auto with_temporary_ozz_allocator(ozz::memory::Allocator* allocator, Fn&& fn)
@@ -141,6 +171,27 @@ static auto with_temporary_ozz_allocator(ozz::memory::Allocator* allocator, Fn&&
     ~RestoreAllocator() { ozz::memory::SetDefaulAllocator(previous); }
   } restore{previous};
   return fn();
+}
+
+static ozz::memory::Allocator* get_base_ozz_allocator_locked() {
+  if (!g_base_ozz_allocator) {
+    g_base_ozz_allocator = ozz::memory::default_allocator();
+  }
+  return g_base_ozz_allocator;
+}
+
+template <typename T, typename... Args>
+static T* alloc_with_ozz_allocator(Args&&... args) {
+  void* mem = ozz::memory::default_allocator()->Allocate(sizeof(T), alignof(T));
+  if (!mem) return nullptr;
+  return new (mem) T(std::forward<Args>(args)...);
+}
+
+template <typename T>
+static void free_with_ozz_allocator(T* object) {
+  if (!object) return;
+  object->~T();
+  ozz::memory::default_allocator()->Deallocate(object);
 }
 }  // namespace
 
@@ -155,13 +206,36 @@ static ozz_result_t load_ozz_object_from_file(const char* path, T* out_obj) {
   return OZZ_OK;
 }
 
+ozz_result_t ozz_set_external_allocator(void* user_data, ozz_alloc_fn alloc_fn, ozz_dealloc_fn dealloc_fn) {
+  ozz_clear_error();
+  if (!alloc_fn || !dealloc_fn) return set_err(OZZ_ERR_INVALID_ARGUMENT, "allocator callbacks null");
+  std::lock_guard<std::mutex> lock(g_ozz_allocator_mutex);
+  get_base_ozz_allocator_locked();
+  g_callback_allocator.configure(user_data, alloc_fn, dealloc_fn);
+  if (ozz::memory::default_allocator() != &g_callback_allocator) {
+    ozz::memory::SetDefaulAllocator(&g_callback_allocator);
+  }
+  return OZZ_OK;
+}
+
+ozz_result_t ozz_reset_external_allocator(void) {
+  ozz_clear_error();
+  std::lock_guard<std::mutex> lock(g_ozz_allocator_mutex);
+  ozz::memory::Allocator* base = get_base_ozz_allocator_locked();
+  g_callback_allocator.clear();
+  if (ozz::memory::default_allocator() == &g_callback_allocator) {
+    ozz::memory::SetDefaulAllocator(base);
+  }
+  return OZZ_OK;
+}
+
 ozz_result_t ozz_skeleton_load_from_file(const char* path, ozz_skeleton_t** out_skel) {
   ozz_clear_error();
   if (!out_skel) return set_err(OZZ_ERR_INVALID_ARGUMENT, "out_skel null");
-  auto* h = new (std::nothrow) ozz_skeleton_t();
+  auto* h = alloc_with_ozz_allocator<ozz_skeleton_t>();
   if (!h) return set_err(OZZ_ERR, "oom");
   ozz_result_t r = load_ozz_object_from_file(path, &h->skel);
-  if (r != OZZ_OK) { delete h; return r; }
+  if (r != OZZ_OK) { free_with_ozz_allocator(h); return r; }
   *out_skel = h;
   return OZZ_OK;
 }
@@ -169,16 +243,16 @@ ozz_result_t ozz_skeleton_load_from_file(const char* path, ozz_skeleton_t** out_
 ozz_result_t ozz_animation_load_from_file(const char* path, ozz_animation_t** out_anim) {
   ozz_clear_error();
   if (!out_anim) return set_err(OZZ_ERR_INVALID_ARGUMENT, "out_anim null");
-  auto* h = new (std::nothrow) ozz_animation_t();
+  auto* h = alloc_with_ozz_allocator<ozz_animation_t>();
   if (!h) return set_err(OZZ_ERR, "oom");
   ozz_result_t r = load_ozz_object_from_file(path, &h->anim);
-  if (r != OZZ_OK) { delete h; return r; }
+  if (r != OZZ_OK) { free_with_ozz_allocator(h); return r; }
   *out_anim = h;
   return OZZ_OK;
 }
 
-void ozz_skeleton_destroy(ozz_skeleton_t* skel) { delete skel; }
-void ozz_animation_destroy(ozz_animation_t* anim) { delete anim; }
+void ozz_skeleton_destroy(ozz_skeleton_t* skel) { free_with_ozz_allocator(skel); }
+void ozz_animation_destroy(ozz_animation_t* anim) { free_with_ozz_allocator(anim); }
 
 int32_t ozz_skeleton_num_joints(const ozz_skeleton_t* skel) {
   return skel ? (int32_t)skel->skel.num_joints() : 0;

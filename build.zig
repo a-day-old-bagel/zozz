@@ -83,7 +83,7 @@ pub fn build(b: *std.Build) void {
         .zozz_runtime = zozz_runtime,
         .cozz_runtime = cozz_runtime,
     });
-    b.installArtifact(debug_skeleton);
+    const install_debug_skeleton = b.addInstallArtifact(debug_skeleton, .{});
 
     const install_assets = b.addInstallDirectory(.{
         .source_dir = b.path("assets"),
@@ -93,10 +93,12 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&install_assets.step);
 
     const debug_skeleton_step = b.step("debug-skeleton", "Build the debug skeleton WGPU example");
-    debug_skeleton_step.dependOn(&debug_skeleton.step);
+    debug_skeleton_step.dependOn(&install_debug_skeleton.step);
+    debug_skeleton_step.dependOn(&install_assets.step);
 
     const run_debug_skeleton = b.addRunArtifact(debug_skeleton);
-    run_debug_skeleton.step.dependOn(b.getInstallStep());
+    run_debug_skeleton.step.dependOn(&install_debug_skeleton.step);
+    run_debug_skeleton.step.dependOn(&install_assets.step);
 
     const debug_skeleton_run_step = b.step("debug-skeleton-run", "Build and run the debug skeleton WGPU example");
     debug_skeleton_run_step.dependOn(&run_debug_skeleton.step);

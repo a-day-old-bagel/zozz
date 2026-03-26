@@ -11,6 +11,10 @@ pub const OzzError = error{
     Unknown,
 };
 
+pub const AllocatorError = error{
+    OzzAllocatorBusy,
+} || OzzError;
+
 fn mapResult(rc: c.ozz_result_t) OzzError!void {
     switch (rc) {
         c.OZZ_OK => return,
@@ -33,6 +37,101 @@ pub fn lastErrorZ() [:0]const u8 {
 
 pub fn clearError() void {
     c.ozz_clear_error();
+}
+
+const OzzAllocHeader = extern struct {
+    base_addr: usize,
+    total_len: usize,
+    base_alignment: u32,
+    reserved: u32 = 0,
+};
+
+comptime {
+    if (@sizeOf(OzzAllocHeader) % @alignOf(OzzAllocHeader) != 0) {
+        @compileError("OzzAllocHeader must be naturally aligned");
+    }
+}
+
+var g_ozz_allocator_lock: std.Thread.Mutex = .{};
+var g_ozz_allocator: ?std.mem.Allocator = null;
+var g_ozz_outstanding_allocations: usize = 0;
+
+fn alignUp(value: usize, alignment: usize) usize {
+    std.debug.assert(alignment != 0);
+    return std.mem.alignForward(usize, value, alignment);
+}
+
+fn currentOzzAllocator() ?std.mem.Allocator {
+    return g_ozz_allocator;
+}
+
+fn ensureAllocatorInstalled() std.mem.Allocator {
+    return currentOzzAllocator() orelse @panic("zozz allocator callback invoked without installAllocator()");
+}
+
+fn ozzAllocCallback(user_data: ?*anyopaque, size: usize, alignment: usize) callconv(.c) ?*anyopaque {
+    _ = user_data;
+    g_ozz_allocator_lock.lock();
+    defer g_ozz_allocator_lock.unlock();
+
+    const allocator = ensureAllocatorInstalled();
+    const user_alignment = @max(alignment, 1);
+    const base_alignment = @max(user_alignment, @alignOf(OzzAllocHeader));
+    const total_len = size + @sizeOf(OzzAllocHeader) + (base_alignment - 1);
+    const raw_ptr = allocator.rawAlloc(
+        total_len,
+        std.mem.Alignment.fromByteUnits(@intCast(base_alignment)),
+        @returnAddress(),
+    ) orelse return null;
+
+    const base_addr = @intFromPtr(raw_ptr);
+    const user_addr = alignUp(base_addr + @sizeOf(OzzAllocHeader), base_alignment);
+    const header_ptr: *OzzAllocHeader = @ptrFromInt(user_addr - @sizeOf(OzzAllocHeader));
+    header_ptr.* = .{
+        .base_addr = base_addr,
+        .total_len = total_len,
+        .base_alignment = @intCast(base_alignment),
+    };
+    g_ozz_outstanding_allocations += 1;
+    return @ptrFromInt(user_addr);
+}
+
+fn ozzFreeCallback(user_data: ?*anyopaque, ptr: ?*anyopaque) callconv(.c) void {
+    _ = user_data;
+    if (ptr == null) return;
+
+    g_ozz_allocator_lock.lock();
+    defer g_ozz_allocator_lock.unlock();
+
+    const allocator = ensureAllocatorInstalled();
+    const user_addr = @intFromPtr(ptr.?);
+    const header_ptr: *const OzzAllocHeader = @ptrFromInt(user_addr - @sizeOf(OzzAllocHeader));
+    const base_ptr: [*]u8 = @ptrFromInt(header_ptr.base_addr);
+    allocator.rawFree(
+        base_ptr[0..header_ptr.total_len],
+        std.mem.Alignment.fromByteUnits(@intCast(header_ptr.base_alignment)),
+        @returnAddress(),
+    );
+    std.debug.assert(g_ozz_outstanding_allocations > 0);
+    g_ozz_outstanding_allocations -= 1;
+}
+
+pub fn installAllocator(allocator: std.mem.Allocator) AllocatorError!void {
+    g_ozz_allocator_lock.lock();
+    defer g_ozz_allocator_lock.unlock();
+
+    if (g_ozz_outstanding_allocations != 0) return AllocatorError.OzzAllocatorBusy;
+    g_ozz_allocator = allocator;
+    try mapResult(c.ozz_set_external_allocator(null, ozzAllocCallback, ozzFreeCallback));
+}
+
+pub fn resetAllocator() AllocatorError!void {
+    g_ozz_allocator_lock.lock();
+    defer g_ozz_allocator_lock.unlock();
+
+    if (g_ozz_outstanding_allocations != 0) return AllocatorError.OzzAllocatorBusy;
+    try mapResult(c.ozz_reset_external_allocator());
+    g_ozz_allocator = null;
 }
 
 // --------------------
@@ -404,12 +503,53 @@ fn paletteDifferenceL1(a: []const f32, b: []const f32) f32 {
     return sum;
 }
 
+const CountingAllocator = struct {
+    backing: std.mem.Allocator,
+    allocations: usize = 0,
+    deallocations: usize = 0,
+    allocated_bytes: usize = 0,
+    freed_bytes: usize = 0,
+
+    fn allocator(self: *CountingAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = std.mem.Allocator.noResize,
+                .remap = std.mem.Allocator.noRemap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.allocations += 1;
+        self.allocated_bytes += len;
+        return ptr;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.deallocations += 1;
+        self.freed_bytes += memory.len;
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+fn testAllocator() std.mem.Allocator {
+    installAllocator(std.testing.allocator) catch unreachable;
+    return std.testing.allocator;
+}
+
 // --------------------
 // Tests
 // --------------------
 
 test "ozz C ABI wrapper: load + 2-clip blend + 3x4 palette is sane" {
-    const A = std.testing.allocator;
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
 
     var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
     defer skel.deinit();
@@ -452,6 +592,9 @@ test "ozz C ABI wrapper: load + 2-clip blend + 3x4 palette is sane" {
 }
 
 test "skeleton joint parent queries are structurally sane" {
+    _ = testAllocator();
+    defer resetAllocator() catch unreachable;
+
     var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
     defer skel.deinit();
 
@@ -477,6 +620,9 @@ test "skeleton joint parent queries are structurally sane" {
 }
 
 test "ratio helper converts normalized phase to animation seconds" {
+    _ = testAllocator();
+    defer resetAllocator() catch unreachable;
+
     var walk = try Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
     defer walk.deinit();
 
@@ -488,7 +634,8 @@ test "ratio helper converts normalized phase to animation seconds" {
 }
 
 test "evalModel3x4 matches upstream reference for a single normal clip" {
-    const A = std.testing.allocator;
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
 
     var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
     defer skel.deinit();
@@ -517,7 +664,8 @@ test "evalModel3x4 matches upstream reference for a single normal clip" {
 }
 
 test "evalModel3x4 matches upstream reference for mixed normal layers" {
-    const A = std.testing.allocator;
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
 
     var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
     defer skel.deinit();
@@ -554,7 +702,8 @@ test "evalModel3x4 matches upstream reference for mixed normal layers" {
 }
 
 test "evalModel3x4 matches upstream reference for additive hand poses" {
-    const A = std.testing.allocator;
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
 
     var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
     defer skel.deinit();
@@ -591,7 +740,8 @@ test "evalModel3x4 matches upstream reference for additive hand poses" {
 }
 
 test "evalModel3x4 matches upstream reference for negative additive weights" {
-    const A = std.testing.allocator;
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
 
     var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
     defer skel.deinit();
@@ -624,7 +774,8 @@ test "evalModel3x4 matches upstream reference for negative additive weights" {
 }
 
 test "partial normal layer masks obey zero and one semantics" {
-    const A = std.testing.allocator;
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
 
     var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
     defer skel.deinit();
@@ -682,7 +833,8 @@ test "partial normal layer masks obey zero and one semantics" {
 }
 
 test "partial additive layer masks obey zero and one semantics" {
-    const A = std.testing.allocator;
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
 
     var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
     defer skel.deinit();
@@ -740,7 +892,8 @@ test "partial additive layer masks obey zero and one semantics" {
 }
 
 test "partial normal blend with sparse mask matches upstream reference" {
-    const A = std.testing.allocator;
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
 
     var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
     defer skel.deinit();
@@ -785,7 +938,8 @@ test "partial normal blend with sparse mask matches upstream reference" {
 }
 
 test "sampling rejects out-of-range ratios" {
-    const A = std.testing.allocator;
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
 
     var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
     defer skel.deinit();
@@ -811,7 +965,8 @@ test "sampling rejects out-of-range ratios" {
 }
 
 test "aim IK matches upstream reference and changes the pose" {
-    const A = std.testing.allocator;
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
 
     var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
     defer skel.deinit();
@@ -865,7 +1020,8 @@ test "aim IK matches upstream reference and changes the pose" {
 }
 
 test "two-bone IK matches upstream reference and changes the pose" {
-    const A = std.testing.allocator;
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
 
     var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
     defer skel.deinit();
@@ -929,4 +1085,22 @@ test "two-bone IK matches upstream reference and changes the pose" {
     const actual_ankle = paletteTranslation(actual, @intCast(ankle));
     const actual_distance = vec3Length(vec3Sub(target, actual_ankle));
     try std.testing.expect(actual_distance < base_distance * 0.4);
+}
+
+test "load-time Ozz allocations route through installed Zig allocator" {
+    var counting = CountingAllocator{ .backing = std.testing.allocator };
+    try installAllocator(counting.allocator());
+    defer resetAllocator() catch unreachable;
+
+    {
+        var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
+        defer skel.deinit();
+
+        var walk = try Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
+        defer walk.deinit();
+    }
+
+    try std.testing.expect(counting.allocations > 0);
+    try std.testing.expect(counting.deallocations > 0);
+    try std.testing.expectEqual(counting.allocated_bytes, counting.freed_bytes);
 }

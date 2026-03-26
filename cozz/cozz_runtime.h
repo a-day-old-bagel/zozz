@@ -19,6 +19,12 @@ typedef enum ozz_result_t {
 const char* ozz_last_error(void);
 void ozz_clear_error(void);
 
+typedef void* (*ozz_alloc_fn)(void* user_data, size_t size, size_t alignment);
+typedef void (*ozz_dealloc_fn)(void* user_data, void* ptr);
+
+ozz_result_t ozz_set_external_allocator(void* user_data, ozz_alloc_fn alloc_fn, ozz_dealloc_fn dealloc_fn);
+ozz_result_t ozz_reset_external_allocator(void);
+
 typedef struct ozz_skeleton_t ozz_skeleton_t;
 typedef struct ozz_animation_t ozz_animation_t;
 
