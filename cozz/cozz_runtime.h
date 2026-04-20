@@ -19,6 +19,12 @@ typedef enum ozz_result_t {
 const char* ozz_last_error(void);
 void ozz_clear_error(void);
 
+typedef void* (*ozz_alloc_fn)(void* user_data, size_t size, size_t alignment);
+typedef void (*ozz_dealloc_fn)(void* user_data, void* ptr);
+
+ozz_result_t ozz_set_external_allocator(void* user_data, ozz_alloc_fn alloc_fn, ozz_dealloc_fn dealloc_fn);
+ozz_result_t ozz_reset_external_allocator(void);
+
 typedef struct ozz_skeleton_t ozz_skeleton_t;
 typedef struct ozz_animation_t ozz_animation_t;
 
@@ -35,10 +41,11 @@ typedef enum ozz_layer_mode_t {
 
 typedef struct ozz_layer_desc_t {
   const ozz_animation_t* anim;
-  float time_seconds;
-  int wrap_time; // 0 clamp, !=0 wrap
+  float ratio; // normalized sample ratio in [0, 1]
   float weight;
   ozz_layer_mode_t mode;
+  const float* joint_weights;   // optional scalar weights, one per joint
+  int32_t joint_weights_count;  // expected to be >= skeleton joint count
 } ozz_layer_desc_t;
 
 typedef struct ozz_vec3_t { float x, y, z; } ozz_vec3_t;
@@ -58,13 +65,17 @@ typedef struct ozz_ik_job_t {
   int32_t mid_joint;
   int32_t end_joint;
   ozz_vec3_t target_ms;
-  ozz_vec3_t pole_ms;
+  ozz_vec3_t pole_ms;        // legacy name: this is a model-space pole vector
+  ozz_vec3_t mid_axis_ls;    // middle joint bend axis, local-space
+  float twist_angle;
+  float soften;
 
   // AIM
   int32_t aim_joint;
   ozz_vec3_t aim_target_ms;
   ozz_vec3_t forward_axis_ls;
   ozz_vec3_t up_axis_ls;
+  ozz_vec3_t aim_pole_vector_ms;
 } ozz_ik_job_t;
 
 // Loading
@@ -74,6 +85,9 @@ void ozz_skeleton_destroy(ozz_skeleton_t* skel);
 void ozz_animation_destroy(ozz_animation_t* anim);
 
 int32_t ozz_skeleton_num_joints(const ozz_skeleton_t* skel);
+int32_t ozz_skeleton_find_joint(const ozz_skeleton_t* skel, const char* name);
+const char* ozz_skeleton_joint_name(const ozz_skeleton_t* skel, int32_t joint);
+int32_t ozz_skeleton_joint_parent(const ozz_skeleton_t* skel, int32_t joint);
 float   ozz_animation_duration(const ozz_animation_t* anim);
 
 // Instance (persistent, per entity)
@@ -92,10 +106,6 @@ void ozz_workspace_deinit(ozz_workspace_t* ws);
 // Evaluate: writes palette into workspace
 // Palette format: float[12*num_joints], column-major 3x4 per joint.
 ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws);
-
-// Validation/reference path used by tests to compare wrapper output against
-// direct upstream ozz jobs. Writes the same palette format as ozz_eval_model_3x4.
-ozz_result_t ozz_eval_model_3x4_reference(ozz_instance_t* inst, ozz_workspace_t* ws);
 
 // Access palette from workspace (valid until next eval on that workspace)
 const float* ozz_workspace_palette_3x4(const ozz_workspace_t* ws);

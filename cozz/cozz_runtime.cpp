@@ -6,6 +6,7 @@
 #include <new>
 #include <cstring>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 #include "ozz/animation/runtime/skeleton.h"
@@ -15,9 +16,11 @@
 #include "ozz/animation/runtime/local_to_model_job.h"
 #include "ozz/animation/runtime/ik_two_bone_job.h"
 #include "ozz/animation/runtime/ik_aim_job.h"
+#include "ozz/animation/runtime/skeleton_utils.h"
 
 #include "ozz/base/io/archive.h"
 #include "ozz/base/io/stream.h"
+#include "ozz/base/memory/allocator.h"
 #include "ozz/base/maths/soa_transform.h"
 #include "ozz/base/maths/soa_float4x4.h"
 #include "ozz/base/maths/simd_math.h"
@@ -26,6 +29,10 @@
 #include "ozz/base/maths/vec_float.h"
 
 static thread_local std::string g_last_error;
+
+static inline bool vec3_is_near_zero(ozz_vec3_t v) {
+  return std::fabs(v.x) + std::fabs(v.y) + std::fabs(v.z) < 1e-6f;
+}
 
 static ozz_result_t set_err(ozz_result_t code, const char* msg) {
   g_last_error = msg ? msg : "";
@@ -57,8 +64,136 @@ static inline T* bump_alloc(void*& cursor, size_t& left, size_t count = 1) {
   left = (size_t)(end - (cur + bytes));
   return (T*)aligned;
 }
+static inline void* bump_alloc_bytes(void*& cursor, size_t& left, size_t bytes, size_t align) {
+  void* aligned = align_up_ptr(cursor, align);
+  uintptr_t cur = (uintptr_t)aligned;
+  uintptr_t end = (uintptr_t)cursor + left;
+  if (cur + bytes > end) return nullptr;
+  cursor = (void*)(cur + bytes);
+  left = (size_t)(end - (cur + bytes));
+  return aligned;
+}
 
 static inline int32_t num_soa_from_joints(int32_t n) { return (n + 3) / 4; }
+
+namespace {
+struct SamplingContextInterpSoaFloat3 {
+  ozz::math::SimdFloat4 ratio[2];
+  ozz::math::SoaFloat3 value[2];
+};
+
+struct SamplingContextInterpSoaQuaternion {
+  ozz::math::SimdFloat4 ratio[2];
+  ozz::math::SoaQuaternion value[2];
+};
+
+class CallbackAllocator final : public ozz::memory::Allocator {
+ public:
+  void configure(void* user_data, ozz_alloc_fn alloc_fn, ozz_dealloc_fn dealloc_fn) {
+    user_data_ = user_data;
+    alloc_fn_ = alloc_fn;
+    dealloc_fn_ = dealloc_fn;
+  }
+
+  void clear() {
+    user_data_ = nullptr;
+    alloc_fn_ = nullptr;
+    dealloc_fn_ = nullptr;
+  }
+
+  void* Allocate(size_t size, size_t alignment) override {
+    return alloc_fn_ ? alloc_fn_(user_data_, size, alignment) : nullptr;
+  }
+
+  void Deallocate(void* block) override {
+    if (dealloc_fn_) dealloc_fn_(user_data_, block);
+  }
+
+ private:
+  void* user_data_ = nullptr;
+  ozz_alloc_fn alloc_fn_ = nullptr;
+  ozz_dealloc_fn dealloc_fn_ = nullptr;
+};
+
+static size_t sampling_context_required_bytes(int32_t num_joints) {
+  const size_t max_soa_tracks = (size_t)num_soa_from_joints(num_joints);
+  const size_t max_tracks = max_soa_tracks * 4;
+  const size_t num_outdated = (max_soa_tracks + 7) / 8;
+  return sizeof(SamplingContextInterpSoaFloat3) * max_soa_tracks +
+      sizeof(SamplingContextInterpSoaQuaternion) * max_soa_tracks +
+      sizeof(SamplingContextInterpSoaFloat3) * max_soa_tracks +
+      sizeof(uint32_t) * max_tracks * 3 +
+      sizeof(uint8_t) * 3 * num_outdated;
+}
+
+static constexpr size_t kSamplingContextAlignment = alignof(SamplingContextInterpSoaFloat3);
+
+class FixedBlockAllocator final : public ozz::memory::Allocator {
+ public:
+  FixedBlockAllocator(void* block, size_t block_size)
+      : block_(static_cast<unsigned char*>(block)), block_size_(block_size) {}
+
+  void* Allocate(size_t size, size_t alignment) override {
+    if (used_) return nullptr;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(block_);
+    const uintptr_t aligned = align_up_uintptr(base, alignment);
+    const size_t padding = (size_t)(aligned - base);
+    if (padding + size > block_size_) return nullptr;
+    used_ = true;
+    allocation_ = reinterpret_cast<void*>(aligned);
+    return allocation_;
+  }
+
+  void Deallocate(void* block) override {
+    if (!block || block == allocation_) return;
+  }
+
+  bool used_block() const { return used_; }
+
+ private:
+  unsigned char* block_ = nullptr;
+  size_t block_size_ = 0;
+  void* allocation_ = nullptr;
+  bool used_ = false;
+};
+
+static std::mutex g_ozz_allocator_mutex;
+static CallbackAllocator g_callback_allocator;
+static ozz::memory::Allocator* g_base_ozz_allocator = nullptr;
+
+template <typename Fn>
+static auto with_temporary_ozz_allocator(ozz::memory::Allocator* allocator, Fn&& fn)
+    -> decltype(fn()) {
+  std::lock_guard<std::mutex> lock(g_ozz_allocator_mutex);
+  ozz::memory::Allocator* previous = ozz::memory::SetDefaulAllocator(allocator);
+  struct RestoreAllocator {
+    ozz::memory::Allocator* previous;
+    ~RestoreAllocator() { ozz::memory::SetDefaulAllocator(previous); }
+  } restore{previous};
+  return fn();
+}
+
+static ozz::memory::Allocator* get_base_ozz_allocator_locked() {
+  if (!g_base_ozz_allocator) {
+    g_base_ozz_allocator = ozz::memory::default_allocator();
+  }
+  return g_base_ozz_allocator;
+}
+
+template <typename T, typename... Args>
+static T* alloc_with_ozz_allocator(Args&&... args) {
+  void* mem = ozz::memory::default_allocator()->Allocate(sizeof(T), alignof(T));
+  if (!mem) return nullptr;
+  return new (mem) T(std::forward<Args>(args)...);
+}
+
+template <typename T>
+static void free_with_ozz_allocator(T* object) {
+  if (!object) return;
+  object->~T();
+  ozz::memory::default_allocator()->Deallocate(object);
+}
+}  // namespace
 
 template <typename T>
 static ozz_result_t load_ozz_object_from_file(const char* path, T* out_obj) {
@@ -71,13 +206,36 @@ static ozz_result_t load_ozz_object_from_file(const char* path, T* out_obj) {
   return OZZ_OK;
 }
 
+ozz_result_t ozz_set_external_allocator(void* user_data, ozz_alloc_fn alloc_fn, ozz_dealloc_fn dealloc_fn) {
+  ozz_clear_error();
+  if (!alloc_fn || !dealloc_fn) return set_err(OZZ_ERR_INVALID_ARGUMENT, "allocator callbacks null");
+  std::lock_guard<std::mutex> lock(g_ozz_allocator_mutex);
+  get_base_ozz_allocator_locked();
+  g_callback_allocator.configure(user_data, alloc_fn, dealloc_fn);
+  if (ozz::memory::default_allocator() != &g_callback_allocator) {
+    ozz::memory::SetDefaulAllocator(&g_callback_allocator);
+  }
+  return OZZ_OK;
+}
+
+ozz_result_t ozz_reset_external_allocator(void) {
+  ozz_clear_error();
+  std::lock_guard<std::mutex> lock(g_ozz_allocator_mutex);
+  ozz::memory::Allocator* base = get_base_ozz_allocator_locked();
+  g_callback_allocator.clear();
+  if (ozz::memory::default_allocator() == &g_callback_allocator) {
+    ozz::memory::SetDefaulAllocator(base);
+  }
+  return OZZ_OK;
+}
+
 ozz_result_t ozz_skeleton_load_from_file(const char* path, ozz_skeleton_t** out_skel) {
   ozz_clear_error();
   if (!out_skel) return set_err(OZZ_ERR_INVALID_ARGUMENT, "out_skel null");
-  auto* h = new (std::nothrow) ozz_skeleton_t();
+  auto* h = alloc_with_ozz_allocator<ozz_skeleton_t>();
   if (!h) return set_err(OZZ_ERR, "oom");
   ozz_result_t r = load_ozz_object_from_file(path, &h->skel);
-  if (r != OZZ_OK) { delete h; return r; }
+  if (r != OZZ_OK) { free_with_ozz_allocator(h); return r; }
   *out_skel = h;
   return OZZ_OK;
 }
@@ -85,19 +243,34 @@ ozz_result_t ozz_skeleton_load_from_file(const char* path, ozz_skeleton_t** out_
 ozz_result_t ozz_animation_load_from_file(const char* path, ozz_animation_t** out_anim) {
   ozz_clear_error();
   if (!out_anim) return set_err(OZZ_ERR_INVALID_ARGUMENT, "out_anim null");
-  auto* h = new (std::nothrow) ozz_animation_t();
+  auto* h = alloc_with_ozz_allocator<ozz_animation_t>();
   if (!h) return set_err(OZZ_ERR, "oom");
   ozz_result_t r = load_ozz_object_from_file(path, &h->anim);
-  if (r != OZZ_OK) { delete h; return r; }
+  if (r != OZZ_OK) { free_with_ozz_allocator(h); return r; }
   *out_anim = h;
   return OZZ_OK;
 }
 
-void ozz_skeleton_destroy(ozz_skeleton_t* skel) { delete skel; }
-void ozz_animation_destroy(ozz_animation_t* anim) { delete anim; }
+void ozz_skeleton_destroy(ozz_skeleton_t* skel) { free_with_ozz_allocator(skel); }
+void ozz_animation_destroy(ozz_animation_t* anim) { free_with_ozz_allocator(anim); }
 
 int32_t ozz_skeleton_num_joints(const ozz_skeleton_t* skel) {
   return skel ? (int32_t)skel->skel.num_joints() : 0;
+}
+int32_t ozz_skeleton_find_joint(const ozz_skeleton_t* skel, const char* name) {
+  return (skel && name) ? (int32_t)ozz::animation::FindJoint(skel->skel, name) : -1;
+}
+const char* ozz_skeleton_joint_name(const ozz_skeleton_t* skel, int32_t joint) {
+  if (!skel) return nullptr;
+  const auto names = skel->skel.joint_names();
+  if (joint < 0 || joint >= (int32_t)names.size()) return nullptr;
+  return names[(size_t)joint];
+}
+int32_t ozz_skeleton_joint_parent(const ozz_skeleton_t* skel, int32_t joint) {
+  if (!skel) return -1;
+  const auto parents = skel->skel.joint_parents();
+  if (joint < 0 || joint >= (int32_t)parents.size()) return -1;
+  return (int32_t)parents[(size_t)joint];
 }
 float ozz_animation_duration(const ozz_animation_t* anim) {
   return anim ? anim->anim.duration() : 0.0f;
@@ -110,10 +283,14 @@ struct ozz_instance_t {
   int32_t num_soa;
 
   ozz::animation::SamplingJob::Context sampling_ctx;
+  void* sampling_ctx_mem;
+  size_t sampling_ctx_mem_bytes;
 
   ozz::math::SoaTransform* accum; // persistent pose (SoA)
+  ozz::math::SimdFloat4* layer_joint_weights; // [OZZ_MAX_LAYERS * num_soa]
 
   ozz_layer_desc_t layers[OZZ_MAX_LAYERS];
+  uint8_t layer_has_joint_weights[OZZ_MAX_LAYERS];
   int32_t layer_count;
 
   ozz_ik_job_t ik[OZZ_MAX_IK_JOBS];
@@ -140,7 +317,9 @@ size_t ozz_instance_required_bytes(const ozz_skeleton_t* skel_h) {
   auto bump = [&](size_t sz, size_t al) { bytes = (bytes + (al - 1)) & ~(al - 1); bytes += sz; };
 
   bump(sizeof(ozz_instance_t), alignof(ozz_instance_t));
+  bump(sampling_context_required_bytes(n), kSamplingContextAlignment);
   bump(sizeof(ozz::math::SoaTransform) * (size_t)ns, alignof(ozz::math::SoaTransform));
+  bump(sizeof(ozz::math::SimdFloat4) * (size_t)(ns * OZZ_MAX_LAYERS), alignof(ozz::math::SimdFloat4));
   return bytes;
 }
 
@@ -158,13 +337,37 @@ ozz_result_t ozz_instance_init(void* mem, size_t mem_bytes, const ozz_skeleton_t
   inst->skel = &skel_h->skel;
   inst->num_joints = (int32_t)skel_h->skel.num_joints();
   inst->num_soa = num_soa_from_joints(inst->num_joints);
-  inst->sampling_ctx.Resize(inst->num_joints);
+  inst->sampling_ctx_mem_bytes = sampling_context_required_bytes(inst->num_joints);
+  inst->sampling_ctx_mem = bump_alloc_bytes(cur, left, inst->sampling_ctx_mem_bytes, kSamplingContextAlignment);
+  if (!inst->sampling_ctx_mem) {
+    inst->~ozz_instance_t();
+    return set_err(OZZ_ERR_INVALID_ARGUMENT, "mem too small (sampling_ctx)");
+  }
+
+  FixedBlockAllocator sampling_ctx_allocator(inst->sampling_ctx_mem, inst->sampling_ctx_mem_bytes);
+  with_temporary_ozz_allocator(&sampling_ctx_allocator, [&]() {
+    inst->sampling_ctx.Resize(inst->num_joints);
+  });
+  if (!sampling_ctx_allocator.used_block()) {
+    inst->~ozz_instance_t();
+    return set_err(OZZ_ERR, "sampling context allocation failed");
+  }
 
   inst->accum = bump_alloc<ozz::math::SoaTransform>(cur, left, (size_t)inst->num_soa);
-  if (!inst->accum) return set_err(OZZ_ERR_INVALID_ARGUMENT, "mem too small (accum)");
+  if (!inst->accum) {
+    ozz_instance_deinit(inst);
+    return set_err(OZZ_ERR_INVALID_ARGUMENT, "mem too small (accum)");
+  }
+
+  inst->layer_joint_weights = bump_alloc<ozz::math::SimdFloat4>(cur, left, (size_t)(inst->num_soa * OZZ_MAX_LAYERS));
+  if (!inst->layer_joint_weights) {
+    ozz_instance_deinit(inst);
+    return set_err(OZZ_ERR_INVALID_ARGUMENT, "mem too small (layer_joint_weights)");
+  }
 
   inst->layer_count = 0;
   inst->ik_count = 0;
+  std::memset(inst->layer_has_joint_weights, 0, sizeof(inst->layer_has_joint_weights));
 
   *out_inst = inst;
   return OZZ_OK;
@@ -172,15 +375,42 @@ ozz_result_t ozz_instance_init(void* mem, size_t mem_bytes, const ozz_skeleton_t
 
 void ozz_instance_deinit(ozz_instance_t* inst) {
   if (!inst) return;
-  inst->~ozz_instance_t(); // frees SamplingJob::Context internal allocations
+  FixedBlockAllocator sampling_ctx_allocator(inst->sampling_ctx_mem, inst->sampling_ctx_mem_bytes);
+  with_temporary_ozz_allocator(&sampling_ctx_allocator, [&]() {
+    inst->~ozz_instance_t();
+  });
 }
 
 void ozz_instance_set_layers(ozz_instance_t* inst, const ozz_layer_desc_t* layers, int32_t count) {
   if (!inst) return;
-  if (!layers || count <= 0) { inst->layer_count = 0; return; }
+  if (!layers || count <= 0) { inst->layer_count = 0; std::memset(inst->layer_has_joint_weights, 0, sizeof(inst->layer_has_joint_weights)); return; }
   if (count > OZZ_MAX_LAYERS) count = OZZ_MAX_LAYERS;
   inst->layer_count = count;
-  for (int32_t i = 0; i < count; ++i) inst->layers[i] = layers[i];
+  for (int32_t i = 0; i < count; ++i) {
+    inst->layers[i] = layers[i];
+    inst->layer_has_joint_weights[i] = 0;
+
+    if (!layers[i].joint_weights || layers[i].joint_weights_count <= 0) {
+      inst->layers[i].joint_weights = nullptr;
+      inst->layers[i].joint_weights_count = 0;
+      continue;
+    }
+
+    ozz::math::SimdFloat4* dst = inst->layer_joint_weights + (size_t)i * (size_t)inst->num_soa;
+    for (int32_t soa = 0; soa < inst->num_soa; ++soa) {
+      const int32_t base = soa * 4;
+      const float x = base + 0 < layers[i].joint_weights_count ? layers[i].joint_weights[base + 0] : 0.f;
+      const float y = base + 1 < layers[i].joint_weights_count ? layers[i].joint_weights[base + 1] : 0.f;
+      const float z = base + 2 < layers[i].joint_weights_count ? layers[i].joint_weights[base + 2] : 0.f;
+      const float w = base + 3 < layers[i].joint_weights_count ? layers[i].joint_weights[base + 3] : 0.f;
+      dst[soa] = ozz::math::simd_float4::Load(x, y, z, w);
+    }
+
+    inst->layer_has_joint_weights[i] = 1;
+  }
+  for (int32_t i = count; i < OZZ_MAX_LAYERS; ++i) {
+    inst->layer_has_joint_weights[i] = 0;
+  }
 }
 
 void ozz_instance_set_ik_jobs(ozz_instance_t* inst, const ozz_ik_job_t* jobs, int32_t count) {
@@ -247,16 +477,8 @@ const float* ozz_workspace_palette_3x4(const ozz_workspace_t* ws) { return ws ? 
 int32_t ozz_workspace_palette_floats(const ozz_workspace_t* ws) { return ws ? (12 * ws->num_joints) : 0; }
 
 // ---- helpers ----
-static inline float wrap_or_clamp(float t, float dur, int wrap) {
-  if (dur <= 0.0f) return 0.0f;
-  if (wrap) {
-    t = std::fmod(t, dur);
-    if (t < 0.0f) t += dur;
-    return t;
-  }
-  if (t < 0.0f) return 0.0f;
-  if (t > dur) return dur;
-  return t;
+static inline bool ratio_is_valid(float ratio) {
+  return std::isfinite(ratio) && ratio >= 0.0f && ratio <= 1.0f;
 }
 
 // Store packed column-major 3x4 (12 floats) from Float4x4 columns.
@@ -274,15 +496,11 @@ static inline ozz::math::SimdFloat4 load3(float x, float y, float z, float w) {
 
 static inline ozz_result_t sample_into(ozz_instance_t* inst,
                                        const ozz_animation_t* anim_h,
-                                       float time_s,
-                                       int wrap,
+                                       float ratio,
                                        ozz::math::SoaTransform* out) {
   if (!anim_h) return OZZ_ERR_INVALID_ARGUMENT;
   if ((int32_t)anim_h->anim.num_tracks() != inst->num_joints) return OZZ_ERR_INVALID_ARGUMENT;
-
-  const float dur = anim_h->anim.duration();
-  const float t = wrap_or_clamp(time_s, dur, wrap);
-  const float ratio = (dur > 0.0f) ? (t / dur) : 0.0f;
+  if (!ratio_is_valid(ratio)) return OZZ_ERR_INVALID_ARGUMENT;
 
   ozz::animation::SamplingJob job;
   job.animation = &anim_h->anim;
@@ -297,15 +515,11 @@ static inline ozz_result_t sample_into_context(int32_t num_joints,
                                                int32_t num_soa,
                                                ozz::animation::SamplingJob::Context* ctx,
                                                const ozz_animation_t* anim_h,
-                                               float time_s,
-                                               int wrap,
+                                               float ratio,
                                                ozz::math::SoaTransform* out) {
   if (!ctx || !anim_h) return OZZ_ERR_INVALID_ARGUMENT;
   if ((int32_t)anim_h->anim.num_tracks() != num_joints) return OZZ_ERR_INVALID_ARGUMENT;
-
-  const float dur = anim_h->anim.duration();
-  const float t = wrap_or_clamp(time_s, dur, wrap);
-  const float ratio = (dur > 0.0f) ? (t / dur) : 0.0f;
+  if (!ratio_is_valid(ratio)) return OZZ_ERR_INVALID_ARGUMENT;
 
   ozz::animation::SamplingJob job;
   job.animation = &anim_h->anim;
@@ -354,8 +568,9 @@ static inline void apply_joint_rotation_correction(
   // Build local quaternion (SIMD)
   ozz::math::SimdQuaternion local_q = { ozz::math::simd_float4::Load(xs[lane], ys[lane], zs[lane], ws[lane])};
 
-  // Multiply & normalize using ozz helpers
-  const ozz::math::SimdQuaternion out = ozz::math::Normalize(corr * local_q);
+  // Upstream Ozz samples post-multiply the returned correction onto the
+  // existing local rotation.
+  const ozz::math::SimdQuaternion out = ozz::math::Normalize(local_q * corr);
 
   // Write back
   alignas(16) float out4[4];
@@ -392,20 +607,26 @@ ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
     if (L.mode == OZZ_LAYER_ADDITIVE) {
       if (additive_count >= OZZ_MAX_LAYERS) continue;
       ozz::math::SoaTransform* dst = ws->sampled_additive + (size_t)additive_count * (size_t)inst->num_soa;
-      ozz_result_t r = sample_into(inst, L.anim, L.time_seconds, L.wrap_time, dst);
+      ozz_result_t r = sample_into(inst, L.anim, L.ratio, dst);
       if (r != OZZ_OK) return set_err(r, "sample failed");
 
       additive_layers[additive_count].transform = ozz::span<const ozz::math::SoaTransform>(dst, inst->num_soa);
       additive_layers[additive_count].weight = L.weight;
+      additive_layers[additive_count].joint_weights = inst->layer_has_joint_weights[i]
+          ? ozz::span<const ozz::math::SimdFloat4>(inst->layer_joint_weights + (size_t)i * (size_t)inst->num_soa, inst->num_soa)
+          : ozz::span<const ozz::math::SimdFloat4>();
       ++additive_count;
     } else {
       if (normal_count >= OZZ_MAX_LAYERS) continue;
       ozz::math::SoaTransform* dst = ws->sampled_normal + (size_t)normal_count * (size_t)inst->num_soa;
-      ozz_result_t r = sample_into(inst, L.anim, L.time_seconds, L.wrap_time, dst);
+      ozz_result_t r = sample_into(inst, L.anim, L.ratio, dst);
       if (r != OZZ_OK) return set_err(r, "sample failed");
 
       normal_layers[normal_count].transform = ozz::span<const ozz::math::SoaTransform>(dst, inst->num_soa);
       normal_layers[normal_count].weight = L.weight;
+      normal_layers[normal_count].joint_weights = inst->layer_has_joint_weights[i]
+          ? ozz::span<const ozz::math::SimdFloat4>(inst->layer_joint_weights + (size_t)i * (size_t)inst->num_soa, inst->num_soa)
+          : ozz::span<const ozz::math::SimdFloat4>();
       ++normal_count;
     }
   }
@@ -439,10 +660,16 @@ ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
         ozz::animation::IKAimJob job;
         job.joint = &ws->model[j];
         job.target = load3(J.aim_target_ms.x, J.aim_target_ms.y, J.aim_target_ms.z, 1.f);
-        job.forward = load3(J.forward_axis_ls.x, J.forward_axis_ls.y, J.forward_axis_ls.z, 0.f);
-        job.up = load3(J.up_axis_ls.x, J.up_axis_ls.y, J.up_axis_ls.z, 0.f);
+        job.forward = vec3_is_near_zero(J.forward_axis_ls)
+            ? ozz::math::simd_float4::x_axis()
+            : load3(J.forward_axis_ls.x, J.forward_axis_ls.y, J.forward_axis_ls.z, 0.f);
+        job.up = vec3_is_near_zero(J.up_axis_ls)
+            ? ozz::math::simd_float4::y_axis()
+            : load3(J.up_axis_ls.x, J.up_axis_ls.y, J.up_axis_ls.z, 0.f);
         job.offset = ozz::math::simd_float4::zero();
-        job.pole_vector = ozz::math::simd_float4::zero();
+        job.pole_vector = vec3_is_near_zero(J.aim_pole_vector_ms)
+            ? ozz::math::simd_float4::y_axis()
+            : load3(J.aim_pole_vector_ms.x, J.aim_pole_vector_ms.y, J.aim_pole_vector_ms.z, 0.f);
         job.weight = J.weight;
 
         ozz::math::SimdQuaternion corr;
@@ -465,12 +692,15 @@ ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
         job.end_joint   = &ws->model[e];
 
         job.target = load3(J.target_ms.x, J.target_ms.y, J.target_ms.z, 1.f);
-        job.pole_vector = load3(J.pole_ms.x, J.pole_ms.y, J.pole_ms.z, 0.f);
-                  
-        job.mid_axis = ozz::math::simd_float4::z_axis();
+        job.pole_vector = vec3_is_near_zero(J.pole_ms)
+            ? ozz::math::simd_float4::y_axis()
+            : load3(J.pole_ms.x, J.pole_ms.y, J.pole_ms.z, 0.f);
+        job.mid_axis = vec3_is_near_zero(J.mid_axis_ls)
+            ? ozz::math::simd_float4::z_axis()
+            : load3(J.mid_axis_ls.x, J.mid_axis_ls.y, J.mid_axis_ls.z, 0.f);
         job.weight = J.weight;
-        job.twist_angle = 0.f;
-        job.soften = 1.f;
+        job.twist_angle = J.twist_angle;
+        job.soften = J.soften;
 
         ozz::math::SimdQuaternion sc, mc;
         job.start_joint_correction = &sc;
@@ -497,14 +727,12 @@ ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
   return OZZ_OK;
 }
 
-ozz_result_t ozz_eval_model_3x4_reference(ozz_instance_t* inst, ozz_workspace_t* ws) {
+extern "C" ozz_result_t ozz_eval_model_3x4_reference(ozz_instance_t* inst, ozz_workspace_t* ws) {
   ozz_clear_error();
   if (!inst || !ws) return set_err(OZZ_ERR_INVALID_ARGUMENT, "null inst/ws");
   if (inst->skel != ws->skel) return set_err(OZZ_ERR_INVALID_ARGUMENT, "skeleton mismatch");
   if (inst->num_joints != ws->num_joints) return set_err(OZZ_ERR_INVALID_ARGUMENT, "size mismatch");
   if (inst->layer_count <= 0) return set_err(OZZ_ERR_INVALID_ARGUMENT, "no layers");
-  if (inst->ik_count > 0) return set_err(OZZ_ERR_INVALID_ARGUMENT, "reference path does not support ik");
-
   std::vector<ozz::math::SoaTransform> sampled_normal;
   std::vector<ozz::math::SoaTransform> sampled_additive;
   std::vector<ozz::animation::BlendingJob::Layer> normal_layers;
@@ -525,23 +753,29 @@ ozz_result_t ozz_eval_model_3x4_reference(ozz_instance_t* inst, ozz_workspace_t*
       if ((int32_t)additive_layers.size() >= OZZ_MAX_LAYERS) continue;
       const size_t offset = sampled_additive.size();
       sampled_additive.resize(offset + (size_t)inst->num_soa);
-      ozz_result_t r = sample_into_context(inst->num_joints, inst->num_soa, &sampling_ctx, L.anim, L.time_seconds, L.wrap_time, sampled_additive.data() + offset);
+      ozz_result_t r = sample_into_context(inst->num_joints, inst->num_soa, &sampling_ctx, L.anim, L.ratio, sampled_additive.data() + offset);
       if (r != OZZ_OK) return set_err(r, "reference sample failed");
 
       ozz::animation::BlendingJob::Layer layer;
       layer.transform = ozz::span<const ozz::math::SoaTransform>(sampled_additive.data() + offset, inst->num_soa);
       layer.weight = L.weight;
+      if (inst->layer_has_joint_weights[i]) {
+        layer.joint_weights = ozz::span<const ozz::math::SimdFloat4>(inst->layer_joint_weights + (size_t)i * (size_t)inst->num_soa, inst->num_soa);
+      }
       additive_layers.push_back(layer);
     } else {
       if ((int32_t)normal_layers.size() >= OZZ_MAX_LAYERS) continue;
       const size_t offset = sampled_normal.size();
       sampled_normal.resize(offset + (size_t)inst->num_soa);
-      ozz_result_t r = sample_into_context(inst->num_joints, inst->num_soa, &sampling_ctx, L.anim, L.time_seconds, L.wrap_time, sampled_normal.data() + offset);
+      ozz_result_t r = sample_into_context(inst->num_joints, inst->num_soa, &sampling_ctx, L.anim, L.ratio, sampled_normal.data() + offset);
       if (r != OZZ_OK) return set_err(r, "reference sample failed");
 
       ozz::animation::BlendingJob::Layer layer;
       layer.transform = ozz::span<const ozz::math::SoaTransform>(sampled_normal.data() + offset, inst->num_soa);
       layer.weight = L.weight;
+      if (inst->layer_has_joint_weights[i]) {
+        layer.joint_weights = ozz::span<const ozz::math::SimdFloat4>(inst->layer_joint_weights + (size_t)i * (size_t)inst->num_soa, inst->num_soa);
+      }
       normal_layers.push_back(layer);
     }
   }
@@ -557,6 +791,75 @@ ozz_result_t ozz_eval_model_3x4_reference(ozz_instance_t* inst, ozz_workspace_t*
 
   if (!blend_job.Validate()) return set_err(OZZ_ERR_OZZ, "reference blend validate failed");
   if (!blend_job.Run()) return set_err(OZZ_ERR_OZZ, "reference blend run failed");
+
+  if (inst->ik_count > 0) {
+    ozz_result_t r = locals_to_model(inst, locals.data(), ws->model);
+    if (r != OZZ_OK) return set_err(r, "reference ltm pre-IK failed");
+
+    for (int32_t i = 0; i < inst->ik_count; ++i) {
+      const ozz_ik_job_t& J = inst->ik[i];
+      if (J.weight <= 0.f) continue;
+
+      if (J.kind == OZZ_IK_AIM) {
+        const int32_t j = J.aim_joint;
+        if (j < 0 || j >= inst->num_joints) continue;
+
+        ozz::animation::IKAimJob job;
+        job.joint = &ws->model[j];
+        job.target = load3(J.aim_target_ms.x, J.aim_target_ms.y, J.aim_target_ms.z, 1.f);
+        job.forward = vec3_is_near_zero(J.forward_axis_ls)
+            ? ozz::math::simd_float4::x_axis()
+            : load3(J.forward_axis_ls.x, J.forward_axis_ls.y, J.forward_axis_ls.z, 0.f);
+        job.up = vec3_is_near_zero(J.up_axis_ls)
+            ? ozz::math::simd_float4::y_axis()
+            : load3(J.up_axis_ls.x, J.up_axis_ls.y, J.up_axis_ls.z, 0.f);
+        job.offset = ozz::math::simd_float4::zero();
+        job.pole_vector = vec3_is_near_zero(J.aim_pole_vector_ms)
+            ? ozz::math::simd_float4::y_axis()
+            : load3(J.aim_pole_vector_ms.x, J.aim_pole_vector_ms.y, J.aim_pole_vector_ms.z, 0.f);
+        job.weight = J.weight;
+
+        ozz::math::SimdQuaternion corr;
+        job.joint_correction = &corr;
+
+        if (!job.Run()) return set_err(OZZ_ERR_OZZ, "reference IKAim failed");
+
+        apply_joint_rotation_correction(j, corr, locals.data(), inst->num_soa);
+
+      } else if (J.kind == OZZ_IK_TWO_BONE) {
+        const int32_t s = J.start_joint;
+        const int32_t m = J.mid_joint;
+        const int32_t e = J.end_joint;
+        if (s < 0 || m < 0 || e < 0) continue;
+        if (s >= inst->num_joints || m >= inst->num_joints || e >= inst->num_joints) continue;
+
+        ozz::animation::IKTwoBoneJob job;
+        job.start_joint = &ws->model[s];
+        job.mid_joint   = &ws->model[m];
+        job.end_joint   = &ws->model[e];
+
+        job.target = load3(J.target_ms.x, J.target_ms.y, J.target_ms.z, 1.f);
+        job.pole_vector = vec3_is_near_zero(J.pole_ms)
+            ? ozz::math::simd_float4::y_axis()
+            : load3(J.pole_ms.x, J.pole_ms.y, J.pole_ms.z, 0.f);
+        job.mid_axis = vec3_is_near_zero(J.mid_axis_ls)
+            ? ozz::math::simd_float4::z_axis()
+            : load3(J.mid_axis_ls.x, J.mid_axis_ls.y, J.mid_axis_ls.z, 0.f);
+        job.weight = J.weight;
+        job.twist_angle = J.twist_angle;
+        job.soften = J.soften;
+
+        ozz::math::SimdQuaternion sc, mc;
+        job.start_joint_correction = &sc;
+        job.mid_joint_correction   = &mc;
+
+        if (!job.Run()) return set_err(OZZ_ERR_OZZ, "reference IKTwoBone failed");
+
+        apply_joint_rotation_correction(s, sc, locals.data(), inst->num_soa);
+        apply_joint_rotation_correction(m, mc, locals.data(), inst->num_soa);
+      }
+    }
+  }
 
   ozz_result_t r = locals_to_model(inst, locals.data(), ws->model);
   if (r != OZZ_OK) return set_err(r, "reference ltm failed");

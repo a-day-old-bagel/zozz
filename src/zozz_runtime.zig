@@ -11,6 +11,10 @@ pub const OzzError = error{
     Unknown,
 };
 
+pub const AllocatorError = error{
+    OzzAllocatorBusy,
+} || OzzError;
+
 fn mapResult(rc: c.ozz_result_t) OzzError!void {
     switch (rc) {
         c.OZZ_OK => return,
@@ -35,6 +39,101 @@ pub fn clearError() void {
     c.ozz_clear_error();
 }
 
+const OzzAllocHeader = extern struct {
+    base_addr: usize,
+    total_len: usize,
+    base_alignment: u32,
+    reserved: u32 = 0,
+};
+
+comptime {
+    if (@sizeOf(OzzAllocHeader) % @alignOf(OzzAllocHeader) != 0) {
+        @compileError("OzzAllocHeader must be naturally aligned");
+    }
+}
+
+var g_ozz_allocator_lock: std.Thread.Mutex = .{};
+var g_ozz_allocator: ?std.mem.Allocator = null;
+var g_ozz_outstanding_allocations: usize = 0;
+
+fn alignUp(value: usize, alignment: usize) usize {
+    std.debug.assert(alignment != 0);
+    return std.mem.alignForward(usize, value, alignment);
+}
+
+fn currentOzzAllocator() ?std.mem.Allocator {
+    return g_ozz_allocator;
+}
+
+fn ensureAllocatorInstalled() std.mem.Allocator {
+    return currentOzzAllocator() orelse @panic("zozz allocator callback invoked without installAllocator()");
+}
+
+fn ozzAllocCallback(user_data: ?*anyopaque, size: usize, alignment: usize) callconv(.c) ?*anyopaque {
+    _ = user_data;
+    g_ozz_allocator_lock.lock();
+    defer g_ozz_allocator_lock.unlock();
+
+    const allocator = ensureAllocatorInstalled();
+    const user_alignment = @max(alignment, 1);
+    const base_alignment = @max(user_alignment, @alignOf(OzzAllocHeader));
+    const total_len = size + @sizeOf(OzzAllocHeader) + (base_alignment - 1);
+    const raw_ptr = allocator.rawAlloc(
+        total_len,
+        std.mem.Alignment.fromByteUnits(@intCast(base_alignment)),
+        @returnAddress(),
+    ) orelse return null;
+
+    const base_addr = @intFromPtr(raw_ptr);
+    const user_addr = alignUp(base_addr + @sizeOf(OzzAllocHeader), base_alignment);
+    const header_ptr: *OzzAllocHeader = @ptrFromInt(user_addr - @sizeOf(OzzAllocHeader));
+    header_ptr.* = .{
+        .base_addr = base_addr,
+        .total_len = total_len,
+        .base_alignment = @intCast(base_alignment),
+    };
+    g_ozz_outstanding_allocations += 1;
+    return @ptrFromInt(user_addr);
+}
+
+fn ozzFreeCallback(user_data: ?*anyopaque, ptr: ?*anyopaque) callconv(.c) void {
+    _ = user_data;
+    if (ptr == null) return;
+
+    g_ozz_allocator_lock.lock();
+    defer g_ozz_allocator_lock.unlock();
+
+    const allocator = ensureAllocatorInstalled();
+    const user_addr = @intFromPtr(ptr.?);
+    const header_ptr: *const OzzAllocHeader = @ptrFromInt(user_addr - @sizeOf(OzzAllocHeader));
+    const base_ptr: [*]u8 = @ptrFromInt(header_ptr.base_addr);
+    allocator.rawFree(
+        base_ptr[0..header_ptr.total_len],
+        std.mem.Alignment.fromByteUnits(@intCast(header_ptr.base_alignment)),
+        @returnAddress(),
+    );
+    std.debug.assert(g_ozz_outstanding_allocations > 0);
+    g_ozz_outstanding_allocations -= 1;
+}
+
+pub fn installAllocator(allocator: std.mem.Allocator) AllocatorError!void {
+    g_ozz_allocator_lock.lock();
+    defer g_ozz_allocator_lock.unlock();
+
+    if (g_ozz_outstanding_allocations != 0) return AllocatorError.OzzAllocatorBusy;
+    g_ozz_allocator = allocator;
+    try mapResult(c.ozz_set_external_allocator(null, ozzAllocCallback, ozzFreeCallback));
+}
+
+pub fn resetAllocator() AllocatorError!void {
+    g_ozz_allocator_lock.lock();
+    defer g_ozz_allocator_lock.unlock();
+
+    if (g_ozz_outstanding_allocations != 0) return AllocatorError.OzzAllocatorBusy;
+    try mapResult(c.ozz_reset_external_allocator());
+    g_ozz_allocator = null;
+}
+
 // --------------------
 // Loaded runtime assets
 // --------------------
@@ -55,6 +154,20 @@ pub const Skeleton = struct {
 
     pub fn numJoints(self: Skeleton) i32 {
         return c.ozz_skeleton_num_joints(self.handle);
+    }
+
+    pub fn findJointZ(self: Skeleton, name_z: [:0]const u8) i32 {
+        return c.ozz_skeleton_find_joint(self.handle, name_z.ptr);
+    }
+
+    pub fn jointName(self: Skeleton, joint: i32) ?[:0]const u8 {
+        const ptr = c.ozz_skeleton_joint_name(self.handle, joint);
+        if (ptr == null) return null;
+        return std.mem.span(ptr);
+    }
+
+    pub fn jointParent(self: Skeleton, joint: i32) i32 {
+        return c.ozz_skeleton_joint_parent(self.handle, joint);
     }
 
     pub fn instanceBytes(self: Skeleton) usize {
@@ -83,6 +196,109 @@ pub const Animation = struct {
     pub fn duration(self: Animation) f32 {
         return c.ozz_animation_duration(self.handle);
     }
+
+    pub fn timeFromRatio(self: Animation, ratio: f32) f32 {
+        return ratio * self.duration();
+    }
+};
+
+pub const Vec3 = extern struct {
+    x: f32,
+    y: f32,
+    z: f32,
+};
+
+pub const IkJob = extern struct {
+    kind: c.ozz_ik_kind_t,
+    weight: f32,
+    start_joint: i32,
+    mid_joint: i32,
+    end_joint: i32,
+    target_ms: Vec3,
+    pole_ms: Vec3,
+    mid_axis_ls: Vec3,
+    twist_angle: f32,
+    soften: f32,
+    aim_joint: i32,
+    aim_target_ms: Vec3,
+    forward_axis_ls: Vec3,
+    up_axis_ls: Vec3,
+    aim_pole_vector_ms: Vec3,
+
+    pub fn aim(joint: i32, target_ms: Vec3, forward_axis_ls: Vec3, up_axis_ls: Vec3, weight: f32) IkJob {
+        return aimWithPole(joint, target_ms, forward_axis_ls, up_axis_ls, .{ .x = 0, .y = 1, .z = 0 }, weight);
+    }
+
+    pub fn aimWithPole(
+        joint: i32,
+        target_ms: Vec3,
+        forward_axis_ls: Vec3,
+        up_axis_ls: Vec3,
+        pole_vector_ms: Vec3,
+        weight: f32,
+    ) IkJob {
+        return .{
+            .kind = c.OZZ_IK_AIM,
+            .weight = weight,
+            .start_joint = -1,
+            .mid_joint = -1,
+            .end_joint = -1,
+            .target_ms = .{ .x = 0, .y = 0, .z = 0 },
+            .pole_ms = .{ .x = 0, .y = 0, .z = 0 },
+            .mid_axis_ls = .{ .x = 0, .y = 0, .z = 1 },
+            .twist_angle = 0,
+            .soften = 1,
+            .aim_joint = joint,
+            .aim_target_ms = target_ms,
+            .forward_axis_ls = forward_axis_ls,
+            .up_axis_ls = up_axis_ls,
+            .aim_pole_vector_ms = pole_vector_ms,
+        };
+    }
+
+    pub fn twoBone(start_joint: i32, mid_joint: i32, end_joint: i32, target_ms: Vec3, pole_ms: Vec3, weight: f32) IkJob {
+        return twoBoneAdvanced(
+            start_joint,
+            mid_joint,
+            end_joint,
+            target_ms,
+            pole_ms,
+            .{ .x = 0, .y = 0, .z = 1 },
+            0,
+            1,
+            weight,
+        );
+    }
+
+    pub fn twoBoneAdvanced(
+        start_joint: i32,
+        mid_joint: i32,
+        end_joint: i32,
+        target_ms: Vec3,
+        pole_ms: Vec3,
+        mid_axis_ls: Vec3,
+        twist_angle: f32,
+        soften: f32,
+        weight: f32,
+    ) IkJob {
+        return .{
+            .kind = c.OZZ_IK_TWO_BONE,
+            .weight = weight,
+            .start_joint = start_joint,
+            .mid_joint = mid_joint,
+            .end_joint = end_joint,
+            .target_ms = target_ms,
+            .pole_ms = pole_ms,
+            .mid_axis_ls = mid_axis_ls,
+            .twist_angle = twist_angle,
+            .soften = soften,
+            .aim_joint = -1,
+            .aim_target_ms = .{ .x = 0, .y = 0, .z = 0 },
+            .forward_axis_ls = .{ .x = 0, .y = 0, .z = 0 },
+            .up_axis_ls = .{ .x = 0, .y = 0, .z = 0 },
+            .aim_pole_vector_ms = .{ .x = 0, .y = 1, .z = 0 },
+        };
+    }
 };
 
 // --------------------
@@ -96,10 +312,20 @@ pub const LayerMode = enum(u32) {
 
 pub const Layer = struct {
     anim: Animation,
-    time_seconds: f32,
-    wrap_time: bool = true,
+    ratio: f32,
     weight: f32,
     mode: LayerMode = .normal,
+    joint_weights: ?[]const f32 = null,
+
+    pub fn atRatio(anim: Animation, sample_ratio: f32, weight: f32, mode: LayerMode) Layer {
+        return .{
+            .anim = anim,
+            .ratio = sample_ratio,
+            .weight = weight,
+            .mode = mode,
+            .joint_weights = null,
+        };
+    }
 };
 
 // --------------------
@@ -136,10 +362,11 @@ pub const Instance = struct {
         for (layers, 0..) |L, i| {
             tmp[i] = .{
                 .anim = L.anim.handle,
-                .time_seconds = L.time_seconds,
-                .wrap_time = @intFromBool(L.wrap_time),
+                .ratio = L.ratio,
                 .weight = L.weight,
                 .mode = @intCast(@intFromEnum(L.mode)),
+                .joint_weights = if (L.joint_weights) |weights| weights.ptr else null,
+                .joint_weights_count = if (L.joint_weights) |weights| @intCast(weights.len) else 0,
             };
         }
 
@@ -150,8 +377,33 @@ pub const Instance = struct {
         );
     }
 
-    // Optional: expose later if you want IK from Zig.
-    // pub fn setIkJobs(...) void { ... }
+    pub fn setIkJobs(self: *Instance, jobs: []const IkJob) void {
+        if (jobs.len > c.OZZ_MAX_IK_JOBS) @panic("too many ik jobs (max 8)");
+
+        var tmp: [c.OZZ_MAX_IK_JOBS]c.ozz_ik_job_t = undefined;
+
+        for (jobs, 0..) |job, i| {
+            tmp[i] = .{
+                .kind = job.kind,
+                .weight = job.weight,
+                .start_joint = job.start_joint,
+                .mid_joint = job.mid_joint,
+                .end_joint = job.end_joint,
+                .target_ms = .{ .x = job.target_ms.x, .y = job.target_ms.y, .z = job.target_ms.z },
+                .pole_ms = .{ .x = job.pole_ms.x, .y = job.pole_ms.y, .z = job.pole_ms.z },
+                .mid_axis_ls = .{ .x = job.mid_axis_ls.x, .y = job.mid_axis_ls.y, .z = job.mid_axis_ls.z },
+                .twist_angle = job.twist_angle,
+                .soften = job.soften,
+                .aim_joint = job.aim_joint,
+                .aim_target_ms = .{ .x = job.aim_target_ms.x, .y = job.aim_target_ms.y, .z = job.aim_target_ms.z },
+                .forward_axis_ls = .{ .x = job.forward_axis_ls.x, .y = job.forward_axis_ls.y, .z = job.forward_axis_ls.z },
+                .up_axis_ls = .{ .x = job.up_axis_ls.x, .y = job.up_axis_ls.y, .z = job.up_axis_ls.z },
+                .aim_pole_vector_ms = .{ .x = job.aim_pole_vector_ms.x, .y = job.aim_pole_vector_ms.y, .z = job.aim_pole_vector_ms.z },
+            };
+        }
+
+        c.ozz_instance_set_ik_jobs(self.handle, if (jobs.len == 0) null else &tmp[0], @intCast(jobs.len));
+    }
 };
 
 // --------------------
@@ -195,8 +447,10 @@ pub fn evalModel3x4(inst: *Instance, ws: *Workspace) ![]const f32 {
     return ws.palette3x4();
 }
 
-pub fn evalModel3x4Reference(inst: *Instance, ws: *Workspace) ![]const f32 {
-    try mapResult(c.ozz_eval_model_3x4_reference(inst.handle, ws.handle));
+extern fn ozz_eval_model_3x4_reference(inst: *c.ozz_instance_t, ws: *c.ozz_workspace_t) c.ozz_result_t;
+
+fn evalModel3x4Reference(inst: *Instance, ws: *Workspace) ![]const f32 {
+    try mapResult(ozz_eval_model_3x4_reference(inst.handle, ws.handle));
     return ws.palette3x4();
 }
 
@@ -213,12 +467,89 @@ fn copyPalette(allocator: std.mem.Allocator, palette: []const f32) ![]f32 {
     return out;
 }
 
+fn paletteTranslation(palette: []const f32, joint: usize) Vec3 {
+    const base = joint * 12;
+    return .{
+        .x = palette[base + 9],
+        .y = palette[base + 10],
+        .z = palette[base + 11],
+    };
+}
+
+fn paletteColumn(palette: []const f32, joint: usize, col: usize) Vec3 {
+    const base = joint * 12 + col * 3;
+    return .{
+        .x = palette[base + 0],
+        .y = palette[base + 1],
+        .z = palette[base + 2],
+    };
+}
+
+fn vec3Add(a: Vec3, b: Vec3) Vec3 {
+    return .{ .x = a.x + b.x, .y = a.y + b.y, .z = a.z + b.z };
+}
+
+fn vec3Sub(a: Vec3, b: Vec3) Vec3 {
+    return .{ .x = a.x - b.x, .y = a.y - b.y, .z = a.z - b.z };
+}
+
+fn vec3Length(v: Vec3) f32 {
+    return @sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+}
+
+fn paletteDifferenceL1(a: []const f32, b: []const f32) f32 {
+    var sum: f32 = 0;
+    for (a, b) |av, bv| sum += @abs(av - bv);
+    return sum;
+}
+
+const CountingAllocator = struct {
+    backing: std.mem.Allocator,
+    allocations: usize = 0,
+    deallocations: usize = 0,
+    allocated_bytes: usize = 0,
+    freed_bytes: usize = 0,
+
+    fn allocator(self: *CountingAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = std.mem.Allocator.noResize,
+                .remap = std.mem.Allocator.noRemap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.allocations += 1;
+        self.allocated_bytes += len;
+        return ptr;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.deallocations += 1;
+        self.freed_bytes += memory.len;
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+fn testAllocator() std.mem.Allocator {
+    installAllocator(std.testing.allocator) catch unreachable;
+    return std.testing.allocator;
+}
+
 // --------------------
 // Tests
 // --------------------
 
 test "ozz C ABI wrapper: load + 2-clip blend + 3x4 palette is sane" {
-    const A = std.testing.allocator;
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
 
     var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
     defer skel.deinit();
@@ -236,8 +567,8 @@ test "ozz C ABI wrapper: load + 2-clip blend + 3x4 palette is sane" {
     defer ws.deinit(A);
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = jog, .time_seconds = 0.10, .wrap_time = true, .weight = 0.35, .mode = .normal },
-        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 0.65, .mode = .normal },
+        .{ .anim = jog, .ratio = 0.10, .weight = 0.35, .mode = .normal },
+        .{ .anim = walk, .ratio = 0.10, .weight = 0.65, .mode = .normal },
     });
 
     const palette = try evalModel3x4(&inst, &ws);
@@ -260,8 +591,51 @@ test "ozz C ABI wrapper: load + 2-clip blend + 3x4 palette is sane" {
     }
 }
 
+test "skeleton joint parent queries are structurally sane" {
+    _ = testAllocator();
+    defer resetAllocator() catch unreachable;
+
+    var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
+    defer skel.deinit();
+
+    const joints = skel.numJoints();
+    try std.testing.expect(joints > 0);
+
+    var root_count: i32 = 0;
+    for (0..@as(usize, @intCast(joints))) |joint_usize| {
+        const joint: i32 = @intCast(joint_usize);
+        try std.testing.expect(skel.jointName(joint) != null);
+
+        const parent = skel.jointParent(joint);
+        if (parent < 0) {
+            root_count += 1;
+            continue;
+        }
+
+        try std.testing.expect(parent < joints);
+        try std.testing.expect(skel.jointName(parent) != null);
+    }
+
+    try std.testing.expect(root_count >= 1);
+}
+
+test "ratio helper converts normalized phase to animation seconds" {
+    _ = testAllocator();
+    defer resetAllocator() catch unreachable;
+
+    var walk = try Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
+    defer walk.deinit();
+
+    const duration = walk.duration();
+    try std.testing.expectApproxEqAbs(duration * 0.25, walk.timeFromRatio(0.25), 1e-6);
+
+    const layer = Layer.atRatio(walk, 0.25, 1.0, .normal);
+    try std.testing.expectApproxEqAbs(0.25, layer.ratio, 1e-6);
+}
+
 test "evalModel3x4 matches upstream reference for a single normal clip" {
-    const A = std.testing.allocator;
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
 
     var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
     defer skel.deinit();
@@ -279,7 +653,7 @@ test "evalModel3x4 matches upstream reference for a single normal clip" {
     defer ws_reference.deinit(A);
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
     });
 
     const actual = try copyPalette(A, try evalModel3x4(&inst, &ws_actual));
@@ -290,7 +664,8 @@ test "evalModel3x4 matches upstream reference for a single normal clip" {
 }
 
 test "evalModel3x4 matches upstream reference for mixed normal layers" {
-    const A = std.testing.allocator;
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
 
     var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
     defer skel.deinit();
@@ -314,9 +689,9 @@ test "evalModel3x4 matches upstream reference for mixed normal layers" {
     defer ws_reference.deinit(A);
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = jog, .time_seconds = 0.10, .wrap_time = true, .weight = 0.20, .mode = .normal },
-        .{ .anim = walk, .time_seconds = 0.25, .wrap_time = true, .weight = 0.35, .mode = .normal },
-        .{ .anim = run, .time_seconds = 0.40, .wrap_time = true, .weight = 0.45, .mode = .normal },
+        .{ .anim = jog, .ratio = 0.10, .weight = 0.20, .mode = .normal },
+        .{ .anim = walk, .ratio = 0.25, .weight = 0.35, .mode = .normal },
+        .{ .anim = run, .ratio = 0.40, .weight = 0.45, .mode = .normal },
     });
 
     const actual = try copyPalette(A, try evalModel3x4(&inst, &ws_actual));
@@ -327,7 +702,8 @@ test "evalModel3x4 matches upstream reference for mixed normal layers" {
 }
 
 test "evalModel3x4 matches upstream reference for additive hand poses" {
-    const A = std.testing.allocator;
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
 
     var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
     defer skel.deinit();
@@ -351,9 +727,9 @@ test "evalModel3x4 matches upstream reference for additive hand poses" {
     defer ws_reference.deinit(A);
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
-        .{ .anim = curl, .time_seconds = 0.0, .wrap_time = true, .weight = 0.30, .mode = .additive },
-        .{ .anim = splay, .time_seconds = 0.0, .wrap_time = true, .weight = 0.90, .mode = .additive },
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+        .{ .anim = curl, .ratio = 0.0, .weight = 0.30, .mode = .additive },
+        .{ .anim = splay, .ratio = 0.0, .weight = 0.90, .mode = .additive },
     });
 
     const actual = try copyPalette(A, try evalModel3x4(&inst, &ws_actual));
@@ -364,7 +740,8 @@ test "evalModel3x4 matches upstream reference for additive hand poses" {
 }
 
 test "evalModel3x4 matches upstream reference for negative additive weights" {
-    const A = std.testing.allocator;
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
 
     var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
     defer skel.deinit();
@@ -385,8 +762,8 @@ test "evalModel3x4 matches upstream reference for negative additive weights" {
     defer ws_reference.deinit(A);
 
     inst.setLayers(&[_]Layer{
-        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
-        .{ .anim = curl, .time_seconds = 0.0, .wrap_time = true, .weight = -0.50, .mode = .additive },
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+        .{ .anim = curl, .ratio = 0.0, .weight = -0.50, .mode = .additive },
     });
 
     const actual = try copyPalette(A, try evalModel3x4(&inst, &ws_actual));
@@ -394,4 +771,336 @@ test "evalModel3x4 matches upstream reference for negative additive weights" {
 
     const reference = try evalModel3x4Reference(&inst, &ws_reference);
     try expectSlicesApproxEqAbs(reference, actual, 1e-4);
+}
+
+test "partial normal layer masks obey zero and one semantics" {
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
+
+    var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
+    defer skel.deinit();
+
+    var walk = try Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
+    defer walk.deinit();
+
+    var jog = try Animation.loadFromFileZ("assets/pab_jog_no_motion.ozz");
+    defer jog.deinit();
+
+    var inst = try Instance.init(A, skel);
+    defer inst.deinit(A);
+
+    var ws_a = try Workspace.init(A, skel);
+    defer ws_a.deinit(A);
+
+    var ws_b = try Workspace.init(A, skel);
+    defer ws_b.deinit(A);
+
+    const joints: usize = @intCast(skel.numJoints());
+    const zero_mask = try A.alloc(f32, joints);
+    defer A.free(zero_mask);
+    @memset(zero_mask, 0);
+
+    const one_mask = try A.alloc(f32, joints);
+    defer A.free(one_mask);
+    @memset(one_mask, 1);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+    });
+    const base = try copyPalette(A, try evalModel3x4(&inst, &ws_a));
+    defer A.free(base);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+        .{ .anim = jog, .ratio = 0.25, .weight = 0.5, .mode = .normal, .joint_weights = zero_mask },
+    });
+    const zeroed = try evalModel3x4(&inst, &ws_b);
+    try expectSlicesApproxEqAbs(base, zeroed, 1e-4);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+        .{ .anim = jog, .ratio = 0.25, .weight = 0.5, .mode = .normal },
+    });
+    const unmasked = try copyPalette(A, try evalModel3x4(&inst, &ws_a));
+    defer A.free(unmasked);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+        .{ .anim = jog, .ratio = 0.25, .weight = 0.5, .mode = .normal, .joint_weights = one_mask },
+    });
+    const ones = try evalModel3x4(&inst, &ws_b);
+    try expectSlicesApproxEqAbs(unmasked, ones, 1e-4);
+}
+
+test "partial additive layer masks obey zero and one semantics" {
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
+
+    var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
+    defer skel.deinit();
+
+    var walk = try Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
+    defer walk.deinit();
+
+    var curl = try Animation.loadFromFileZ("assets/pab_curl_additive.ozz");
+    defer curl.deinit();
+
+    var inst = try Instance.init(A, skel);
+    defer inst.deinit(A);
+
+    var ws_a = try Workspace.init(A, skel);
+    defer ws_a.deinit(A);
+
+    var ws_b = try Workspace.init(A, skel);
+    defer ws_b.deinit(A);
+
+    const joints: usize = @intCast(skel.numJoints());
+    const zero_mask = try A.alloc(f32, joints);
+    defer A.free(zero_mask);
+    @memset(zero_mask, 0);
+
+    const one_mask = try A.alloc(f32, joints);
+    defer A.free(one_mask);
+    @memset(one_mask, 1);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+    });
+    const base = try copyPalette(A, try evalModel3x4(&inst, &ws_a));
+    defer A.free(base);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+        .{ .anim = curl, .ratio = 0.0, .weight = 0.6, .mode = .additive, .joint_weights = zero_mask },
+    });
+    const zeroed = try evalModel3x4(&inst, &ws_b);
+    try expectSlicesApproxEqAbs(base, zeroed, 1e-4);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+        .{ .anim = curl, .ratio = 0.0, .weight = 0.6, .mode = .additive },
+    });
+    const unmasked = try copyPalette(A, try evalModel3x4(&inst, &ws_a));
+    defer A.free(unmasked);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+        .{ .anim = curl, .ratio = 0.0, .weight = 0.6, .mode = .additive, .joint_weights = one_mask },
+    });
+    const ones = try evalModel3x4(&inst, &ws_b);
+    try expectSlicesApproxEqAbs(unmasked, ones, 1e-4);
+}
+
+test "partial normal blend with sparse mask matches upstream reference" {
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
+
+    var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
+    defer skel.deinit();
+
+    var walk = try Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
+    defer walk.deinit();
+
+    var run = try Animation.loadFromFileZ("assets/pab_run_no_motion.ozz");
+    defer run.deinit();
+
+    var inst = try Instance.init(A, skel);
+    defer inst.deinit(A);
+
+    var ws_actual = try Workspace.init(A, skel);
+    defer ws_actual.deinit(A);
+
+    var ws_reference = try Workspace.init(A, skel);
+    defer ws_reference.deinit(A);
+
+    const joints: usize = @intCast(skel.numJoints());
+    const mask = try A.alloc(f32, joints);
+    defer A.free(mask);
+
+    for (mask, 0..) |*weight, j| {
+        weight.* = switch (j % 4) {
+            0 => 1.0,
+            1 => 0.5,
+            else => 0.0,
+        };
+    }
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+        .{ .anim = run, .ratio = 0.30, .weight = 0.7, .mode = .normal, .joint_weights = mask },
+    });
+
+    const actual = try copyPalette(A, try evalModel3x4(&inst, &ws_actual));
+    defer A.free(actual);
+
+    const reference = try evalModel3x4Reference(&inst, &ws_reference);
+    try expectSlicesApproxEqAbs(reference, actual, 1e-4);
+}
+
+test "sampling rejects out-of-range ratios" {
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
+
+    var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
+    defer skel.deinit();
+
+    var walk = try Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
+    defer walk.deinit();
+
+    var inst = try Instance.init(A, skel);
+    defer inst.deinit(A);
+
+    var ws_a = try Workspace.init(A, skel);
+    defer ws_a.deinit(A);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .ratio = -0.1, .weight = 1.0, .mode = .normal },
+    });
+    try std.testing.expectError(OzzError.InvalidArgument, evalModel3x4(&inst, &ws_a));
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .ratio = 1.1, .weight = 1.0, .mode = .normal },
+    });
+    try std.testing.expectError(OzzError.InvalidArgument, evalModel3x4(&inst, &ws_a));
+}
+
+test "aim IK matches upstream reference and changes the pose" {
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
+
+    var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
+    defer skel.deinit();
+
+    const head_joint = skel.findJointZ("Head");
+    try std.testing.expect(head_joint >= 0);
+
+    var walk = try Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
+    defer walk.deinit();
+
+    var inst = try Instance.init(A, skel);
+    defer inst.deinit(A);
+
+    var ws_base = try Workspace.init(A, skel);
+    defer ws_base.deinit(A);
+
+    var ws_actual = try Workspace.init(A, skel);
+    defer ws_actual.deinit(A);
+
+    var ws_reference = try Workspace.init(A, skel);
+    defer ws_reference.deinit(A);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+    });
+    inst.setIkJobs(&.{});
+
+    const base_palette = try copyPalette(A, try evalModel3x4(&inst, &ws_base));
+    defer A.free(base_palette);
+
+    const head_pos = paletteTranslation(base_palette, @intCast(head_joint));
+    const aim_target = vec3Add(head_pos, .{ .x = 0.75, .y = 0.25, .z = -0.50 });
+
+    inst.setIkJobs(&[_]IkJob{
+        IkJob.aimWithPole(
+            head_joint,
+            aim_target,
+            .{ .x = 1, .y = 0, .z = 0 },
+            .{ .x = 0, .y = 1, .z = 0 },
+            .{ .x = 0, .y = 1, .z = 0 },
+            1.0,
+        ),
+    });
+
+    const actual = try copyPalette(A, try evalModel3x4(&inst, &ws_actual));
+    defer A.free(actual);
+
+    const reference = try evalModel3x4Reference(&inst, &ws_reference);
+    try expectSlicesApproxEqAbs(reference, actual, 1e-4);
+    try std.testing.expect(paletteDifferenceL1(base_palette, actual) > 1e-3);
+}
+
+test "two-bone IK matches upstream reference and changes the pose" {
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
+
+    var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
+    defer skel.deinit();
+
+    const hip = skel.findJointZ("LeftUpLeg");
+    const knee = skel.findJointZ("LeftLeg");
+    const ankle = skel.findJointZ("LeftFoot");
+    try std.testing.expect(hip >= 0);
+    try std.testing.expect(knee >= 0);
+    try std.testing.expect(ankle >= 0);
+
+    var walk = try Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
+    defer walk.deinit();
+
+    var inst = try Instance.init(A, skel);
+    defer inst.deinit(A);
+
+    var ws_base = try Workspace.init(A, skel);
+    defer ws_base.deinit(A);
+
+    var ws_actual = try Workspace.init(A, skel);
+    defer ws_actual.deinit(A);
+
+    var ws_reference = try Workspace.init(A, skel);
+    defer ws_reference.deinit(A);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .ratio = 0.10, .weight = 1.0, .mode = .normal },
+    });
+    inst.setIkJobs(&.{});
+
+    const base_palette = try copyPalette(A, try evalModel3x4(&inst, &ws_base));
+    defer A.free(base_palette);
+
+    const ankle_pos = paletteTranslation(base_palette, @intCast(ankle));
+    const knee_pole = paletteColumn(base_palette, @intCast(knee), 1);
+    const target = vec3Add(ankle_pos, .{ .x = 0.15, .y = -0.10, .z = 0.10 });
+    const base_distance = vec3Length(vec3Sub(target, ankle_pos));
+
+    inst.setIkJobs(&[_]IkJob{
+        IkJob.twoBoneAdvanced(
+            hip,
+            knee,
+            ankle,
+            target,
+            knee_pole,
+            .{ .x = 0, .y = 0, .z = 1 },
+            0.0,
+            1.0,
+            1.0,
+        ),
+    });
+
+    const actual = try copyPalette(A, try evalModel3x4(&inst, &ws_actual));
+    defer A.free(actual);
+
+    const reference = try evalModel3x4Reference(&inst, &ws_reference);
+    try expectSlicesApproxEqAbs(reference, actual, 1e-4);
+    try std.testing.expect(paletteDifferenceL1(base_palette, actual) > 1e-3);
+
+    const actual_ankle = paletteTranslation(actual, @intCast(ankle));
+    const actual_distance = vec3Length(vec3Sub(target, actual_ankle));
+    try std.testing.expect(actual_distance < base_distance * 0.4);
+}
+
+test "load-time Ozz allocations route through installed Zig allocator" {
+    var counting = CountingAllocator{ .backing = std.testing.allocator };
+    try installAllocator(counting.allocator());
+    defer resetAllocator() catch unreachable;
+
+    {
+        var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
+        defer skel.deinit();
+
+        var walk = try Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
+        defer walk.deinit();
+    }
+
+    try std.testing.expect(counting.allocations > 0);
+    try std.testing.expect(counting.deallocations > 0);
+    try std.testing.expectEqual(counting.allocated_bytes, counting.freed_bytes);
 }
