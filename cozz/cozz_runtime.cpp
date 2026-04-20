@@ -6,6 +6,7 @@
 #include <new>
 #include <cstring>
 #include <cstdint>
+#include <vector>
 
 #include "ozz/animation/runtime/skeleton.h"
 #include "ozz/animation/runtime/animation.h"
@@ -124,7 +125,8 @@ struct ozz_workspace_t {
   int32_t num_joints;
   int32_t num_soa;
 
-  ozz::math::SoaTransform* temp;      // scratch (SoA) - sampling target
+  ozz::math::SoaTransform* sampled_normal;   // [OZZ_MAX_LAYERS * num_soa]
+  ozz::math::SoaTransform* sampled_additive; // [OZZ_MAX_LAYERS * num_soa]
   ozz::math::Float4x4* model;         // scratch
   float* palette;                     // output: 12*num_joints floats
 };
@@ -198,7 +200,8 @@ size_t ozz_workspace_required_bytes(const ozz_skeleton_t* skel_h) {
   auto bump = [&](size_t sz, size_t al) { bytes = (bytes + (al - 1)) & ~(al - 1); bytes += sz; };
 
   bump(sizeof(ozz_workspace_t), alignof(ozz_workspace_t));
-  bump(sizeof(ozz::math::SoaTransform) * (size_t)ns, alignof(ozz::math::SoaTransform)); // temp
+  bump(sizeof(ozz::math::SoaTransform) * (size_t)(ns * OZZ_MAX_LAYERS), alignof(ozz::math::SoaTransform)); // sampled_normal
+  bump(sizeof(ozz::math::SoaTransform) * (size_t)(ns * OZZ_MAX_LAYERS), alignof(ozz::math::SoaTransform)); // sampled_additive
   bump(sizeof(ozz::math::Float4x4) * (size_t)n, alignof(ozz::math::Float4x4));          // model
   bump(sizeof(float) * (size_t)(12 * n), alignof(float));                               // palette
   return bytes;
@@ -219,8 +222,11 @@ ozz_result_t ozz_workspace_init(void* mem, size_t mem_bytes, const ozz_skeleton_
   ws->num_joints = (int32_t)skel_h->skel.num_joints();
   ws->num_soa = num_soa_from_joints(ws->num_joints);
 
-  ws->temp = bump_alloc<ozz::math::SoaTransform>(cur, left, (size_t)ws->num_soa);
-  if (!ws->temp) return set_err(OZZ_ERR_INVALID_ARGUMENT, "mem too small (temp)");
+  ws->sampled_normal = bump_alloc<ozz::math::SoaTransform>(cur, left, (size_t)(ws->num_soa * OZZ_MAX_LAYERS));
+  if (!ws->sampled_normal) return set_err(OZZ_ERR_INVALID_ARGUMENT, "mem too small (sampled_normal)");
+
+  ws->sampled_additive = bump_alloc<ozz::math::SoaTransform>(cur, left, (size_t)(ws->num_soa * OZZ_MAX_LAYERS));
+  if (!ws->sampled_additive) return set_err(OZZ_ERR_INVALID_ARGUMENT, "mem too small (sampled_additive)");
 
   ws->model = bump_alloc<ozz::math::Float4x4>(cur, left, (size_t)ws->num_joints);
   if (!ws->model) return set_err(OZZ_ERR_INVALID_ARGUMENT, "mem too small (model)");
@@ -287,6 +293,35 @@ static inline ozz_result_t sample_into(ozz_instance_t* inst,
   return job.Run() ? OZZ_OK : OZZ_ERR_OZZ;
 }
 
+static inline ozz_result_t sample_into_context(int32_t num_joints,
+                                               int32_t num_soa,
+                                               ozz::animation::SamplingJob::Context* ctx,
+                                               const ozz_animation_t* anim_h,
+                                               float time_s,
+                                               int wrap,
+                                               ozz::math::SoaTransform* out) {
+  if (!ctx || !anim_h) return OZZ_ERR_INVALID_ARGUMENT;
+  if ((int32_t)anim_h->anim.num_tracks() != num_joints) return OZZ_ERR_INVALID_ARGUMENT;
+
+  const float dur = anim_h->anim.duration();
+  const float t = wrap_or_clamp(time_s, dur, wrap);
+  const float ratio = (dur > 0.0f) ? (t / dur) : 0.0f;
+
+  ozz::animation::SamplingJob job;
+  job.animation = &anim_h->anim;
+  job.context = ctx;
+  job.ratio = ratio;
+  job.output = ozz::span<ozz::math::SoaTransform>(out, num_soa);
+
+  return job.Run() ? OZZ_OK : OZZ_ERR_OZZ;
+}
+
+static inline bool should_skip_layer(const ozz_layer_desc_t& layer) {
+  if (!layer.anim || layer.weight == 0.f) return true;
+  if (layer.mode != OZZ_LAYER_ADDITIVE && layer.weight < 0.f) return true;
+  return false;
+}
+
 static inline ozz_result_t locals_to_model(const ozz_instance_t* inst,
                                            const ozz::math::SoaTransform* locals,
                                            ozz::math::Float4x4* out_model) {
@@ -345,72 +380,48 @@ ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
   if (inst->num_joints != ws->num_joints) return set_err(OZZ_ERR_INVALID_ARGUMENT, "size mismatch");
   if (inst->layer_count <= 0) return set_err(OZZ_ERR_INVALID_ARGUMENT, "no layers");
 
-  bool have_normal = false;
-  float sum_normal = 0.0f;
+  ozz::animation::BlendingJob::Layer normal_layers[OZZ_MAX_LAYERS];
+  ozz::animation::BlendingJob::Layer additive_layers[OZZ_MAX_LAYERS];
+  int32_t normal_count = 0;
+  int32_t additive_count = 0;
 
-  // 1) normal layers
+  // 1) sample layers into workspace buffers
   for (int32_t i = 0; i < inst->layer_count; ++i) {
     const ozz_layer_desc_t& L = inst->layers[i];
-    if (!L.anim || L.weight <= 0.f) continue;
-    if (L.mode == OZZ_LAYER_ADDITIVE) continue;
+    if (should_skip_layer(L)) continue;
+    if (L.mode == OZZ_LAYER_ADDITIVE) {
+      if (additive_count >= OZZ_MAX_LAYERS) continue;
+      ozz::math::SoaTransform* dst = ws->sampled_additive + (size_t)additive_count * (size_t)inst->num_soa;
+      ozz_result_t r = sample_into(inst, L.anim, L.time_seconds, L.wrap_time, dst);
+      if (r != OZZ_OK) return set_err(r, "sample failed");
 
-    ozz_result_t r = sample_into(inst, L.anim, L.time_seconds, L.wrap_time, ws->temp);
-    if (r != OZZ_OK) return set_err(r, "sample failed");
-
-    if (!have_normal) {
-      std::memcpy(inst->accum, ws->temp, sizeof(ozz::math::SoaTransform) * (size_t)inst->num_soa);
-      have_normal = true;
-      sum_normal = L.weight;
+      additive_layers[additive_count].transform = ozz::span<const ozz::math::SoaTransform>(dst, inst->num_soa);
+      additive_layers[additive_count].weight = L.weight;
+      ++additive_count;
     } else {
-      ozz::animation::BlendingJob::Layer two[2];
-      two[0].transform = ozz::span<const ozz::math::SoaTransform>(inst->accum, inst->num_soa);
-      two[0].weight = sum_normal;
-      two[1].transform = ozz::span<const ozz::math::SoaTransform>(ws->temp, inst->num_soa);
-      two[1].weight = L.weight;
+      if (normal_count >= OZZ_MAX_LAYERS) continue;
+      ozz::math::SoaTransform* dst = ws->sampled_normal + (size_t)normal_count * (size_t)inst->num_soa;
+      ozz_result_t r = sample_into(inst, L.anim, L.time_seconds, L.wrap_time, dst);
+      if (r != OZZ_OK) return set_err(r, "sample failed");
 
-      ozz::animation::BlendingJob job;
-      job.threshold = 0.1f;
-      job.rest_pose = inst->skel->joint_rest_poses();
-      job.layers = ozz::span<const ozz::animation::BlendingJob::Layer>(two, 2);
-      job.additive_layers = {};
-      job.output = ozz::span<ozz::math::SoaTransform>(inst->accum, inst->num_soa);
-
-      if (!job.Validate()) return set_err(OZZ_ERR_OZZ, "blend validate failed");
-      if (!job.Run()) return set_err(OZZ_ERR_OZZ, "blend run failed");
-
-      sum_normal += L.weight;
+      normal_layers[normal_count].transform = ozz::span<const ozz::math::SoaTransform>(dst, inst->num_soa);
+      normal_layers[normal_count].weight = L.weight;
+      ++normal_count;
     }
   }
 
-  if (!have_normal) return set_err(OZZ_ERR_INVALID_ARGUMENT, "no normal layers");
+  if (normal_count <= 0) return set_err(OZZ_ERR_INVALID_ARGUMENT, "no normal layers");
 
-  // 2) additive layers
-  for (int32_t i = 0; i < inst->layer_count; ++i) {
-    const ozz_layer_desc_t& L = inst->layers[i];
-    if (!L.anim || L.weight <= 0.f) continue;
-    if (L.mode != OZZ_LAYER_ADDITIVE) continue;
+  // 2) single blending job: normals + additives
+  ozz::animation::BlendingJob blend_job;
+  blend_job.threshold = 0.1f;
+  blend_job.rest_pose = inst->skel->joint_rest_poses();
+  blend_job.layers = ozz::span<const ozz::animation::BlendingJob::Layer>(normal_layers, normal_count);
+  blend_job.additive_layers = ozz::span<const ozz::animation::BlendingJob::Layer>(additive_layers, additive_count);
+  blend_job.output = ozz::span<ozz::math::SoaTransform>(inst->accum, inst->num_soa);
 
-    ozz_result_t r = sample_into(inst, L.anim, L.time_seconds, L.wrap_time, ws->temp);
-    if (r != OZZ_OK) return set_err(r, "sample failed");
-
-    ozz::animation::BlendingJob::Layer base;
-    base.transform = ozz::span<const ozz::math::SoaTransform>(inst->accum, inst->num_soa);
-    base.weight = 1.f;
-
-    ozz::animation::BlendingJob::Layer add;
-    add.transform = ozz::span<const ozz::math::SoaTransform>(ws->temp, inst->num_soa);
-    add.weight = L.weight;
-
-    ozz::animation::BlendingJob job;
-    job.threshold = 0.1f;
-    job.rest_pose = inst->skel->joint_rest_poses();
-    job.layers = ozz::span<const ozz::animation::BlendingJob::Layer>(&base, 1);
-    job.additive_layers = ozz::span<const ozz::animation::BlendingJob::Layer>(&add, 1);
-    job.output = ozz::span<ozz::math::SoaTransform>(inst->accum, inst->num_soa);
-    
-    if (!job.Validate()) return set_err(OZZ_ERR_OZZ, "additive validate failed");
-    if (!job.Run()) return set_err(OZZ_ERR_OZZ, "additive run failed");
-  }
+  if (!blend_job.Validate()) return set_err(OZZ_ERR_OZZ, "blend validate failed");
+  if (!blend_job.Run()) return set_err(OZZ_ERR_OZZ, "blend run failed");
 
   // 3) IK
   if (inst->ik_count > 0) {
@@ -481,6 +492,77 @@ ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
     for (int32_t i = 0; i < inst->num_joints; ++i) {
       store_3x4_col_major(ws->model[i], ws->palette + (size_t)i * 12u);
     }
+  }
+
+  return OZZ_OK;
+}
+
+ozz_result_t ozz_eval_model_3x4_reference(ozz_instance_t* inst, ozz_workspace_t* ws) {
+  ozz_clear_error();
+  if (!inst || !ws) return set_err(OZZ_ERR_INVALID_ARGUMENT, "null inst/ws");
+  if (inst->skel != ws->skel) return set_err(OZZ_ERR_INVALID_ARGUMENT, "skeleton mismatch");
+  if (inst->num_joints != ws->num_joints) return set_err(OZZ_ERR_INVALID_ARGUMENT, "size mismatch");
+  if (inst->layer_count <= 0) return set_err(OZZ_ERR_INVALID_ARGUMENT, "no layers");
+  if (inst->ik_count > 0) return set_err(OZZ_ERR_INVALID_ARGUMENT, "reference path does not support ik");
+
+  std::vector<ozz::math::SoaTransform> sampled_normal;
+  std::vector<ozz::math::SoaTransform> sampled_additive;
+  std::vector<ozz::animation::BlendingJob::Layer> normal_layers;
+  std::vector<ozz::animation::BlendingJob::Layer> additive_layers;
+  std::vector<ozz::math::SoaTransform> locals((size_t)inst->num_soa);
+  ozz::animation::SamplingJob::Context sampling_ctx(inst->num_joints);
+
+  sampled_normal.reserve((size_t)inst->num_soa * (size_t)OZZ_MAX_LAYERS);
+  sampled_additive.reserve((size_t)inst->num_soa * (size_t)OZZ_MAX_LAYERS);
+  normal_layers.reserve(OZZ_MAX_LAYERS);
+  additive_layers.reserve(OZZ_MAX_LAYERS);
+
+  for (int32_t i = 0; i < inst->layer_count; ++i) {
+    const ozz_layer_desc_t& L = inst->layers[i];
+    if (should_skip_layer(L)) continue;
+
+    if (L.mode == OZZ_LAYER_ADDITIVE) {
+      if ((int32_t)additive_layers.size() >= OZZ_MAX_LAYERS) continue;
+      const size_t offset = sampled_additive.size();
+      sampled_additive.resize(offset + (size_t)inst->num_soa);
+      ozz_result_t r = sample_into_context(inst->num_joints, inst->num_soa, &sampling_ctx, L.anim, L.time_seconds, L.wrap_time, sampled_additive.data() + offset);
+      if (r != OZZ_OK) return set_err(r, "reference sample failed");
+
+      ozz::animation::BlendingJob::Layer layer;
+      layer.transform = ozz::span<const ozz::math::SoaTransform>(sampled_additive.data() + offset, inst->num_soa);
+      layer.weight = L.weight;
+      additive_layers.push_back(layer);
+    } else {
+      if ((int32_t)normal_layers.size() >= OZZ_MAX_LAYERS) continue;
+      const size_t offset = sampled_normal.size();
+      sampled_normal.resize(offset + (size_t)inst->num_soa);
+      ozz_result_t r = sample_into_context(inst->num_joints, inst->num_soa, &sampling_ctx, L.anim, L.time_seconds, L.wrap_time, sampled_normal.data() + offset);
+      if (r != OZZ_OK) return set_err(r, "reference sample failed");
+
+      ozz::animation::BlendingJob::Layer layer;
+      layer.transform = ozz::span<const ozz::math::SoaTransform>(sampled_normal.data() + offset, inst->num_soa);
+      layer.weight = L.weight;
+      normal_layers.push_back(layer);
+    }
+  }
+
+  if (normal_layers.empty()) return set_err(OZZ_ERR_INVALID_ARGUMENT, "no normal layers");
+
+  ozz::animation::BlendingJob blend_job;
+  blend_job.threshold = 0.1f;
+  blend_job.rest_pose = inst->skel->joint_rest_poses();
+  blend_job.layers = ozz::span<const ozz::animation::BlendingJob::Layer>(normal_layers.data(), normal_layers.size());
+  blend_job.additive_layers = ozz::span<const ozz::animation::BlendingJob::Layer>(additive_layers.data(), additive_layers.size());
+  blend_job.output = ozz::span<ozz::math::SoaTransform>(locals.data(), locals.size());
+
+  if (!blend_job.Validate()) return set_err(OZZ_ERR_OZZ, "reference blend validate failed");
+  if (!blend_job.Run()) return set_err(OZZ_ERR_OZZ, "reference blend run failed");
+
+  ozz_result_t r = locals_to_model(inst, locals.data(), ws->model);
+  if (r != OZZ_OK) return set_err(r, "reference ltm failed");
+
+  for (int32_t i = 0; i < inst->num_joints; ++i) {
+    store_3x4_col_major(ws->model[i], ws->palette + (size_t)i * 12u);
   }
 
   return OZZ_OK;

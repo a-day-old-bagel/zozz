@@ -195,6 +195,24 @@ pub fn evalModel3x4(inst: *Instance, ws: *Workspace) ![]const f32 {
     return ws.palette3x4();
 }
 
+pub fn evalModel3x4Reference(inst: *Instance, ws: *Workspace) ![]const f32 {
+    try mapResult(c.ozz_eval_model_3x4_reference(inst.handle, ws.handle));
+    return ws.palette3x4();
+}
+
+fn expectSlicesApproxEqAbs(expected: []const f32, actual: []const f32, tolerance: f32) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |exp, act| {
+        try std.testing.expectApproxEqAbs(exp, act, tolerance);
+    }
+}
+
+fn copyPalette(allocator: std.mem.Allocator, palette: []const f32) ![]f32 {
+    const out = try allocator.alloc(f32, palette.len);
+    @memcpy(out, palette);
+    return out;
+}
+
 // --------------------
 // Tests
 // --------------------
@@ -240,4 +258,140 @@ test "ozz C ABI wrapper: load + 2-clip blend + 3x4 palette is sane" {
         try std.testing.expect(std.math.isFinite(ty));
         try std.testing.expect(std.math.isFinite(tz));
     }
+}
+
+test "evalModel3x4 matches upstream reference for a single normal clip" {
+    const A = std.testing.allocator;
+
+    var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
+    defer skel.deinit();
+
+    var walk = try Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
+    defer walk.deinit();
+
+    var inst = try Instance.init(A, skel);
+    defer inst.deinit(A);
+
+    var ws_actual = try Workspace.init(A, skel);
+    defer ws_actual.deinit(A);
+
+    var ws_reference = try Workspace.init(A, skel);
+    defer ws_reference.deinit(A);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
+    });
+
+    const actual = try copyPalette(A, try evalModel3x4(&inst, &ws_actual));
+    defer A.free(actual);
+
+    const reference = try evalModel3x4Reference(&inst, &ws_reference);
+    try expectSlicesApproxEqAbs(reference, actual, 1e-4);
+}
+
+test "evalModel3x4 matches upstream reference for mixed normal layers" {
+    const A = std.testing.allocator;
+
+    var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
+    defer skel.deinit();
+
+    var jog = try Animation.loadFromFileZ("assets/pab_jog_no_motion.ozz");
+    defer jog.deinit();
+
+    var walk = try Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
+    defer walk.deinit();
+
+    var run = try Animation.loadFromFileZ("assets/pab_run_no_motion.ozz");
+    defer run.deinit();
+
+    var inst = try Instance.init(A, skel);
+    defer inst.deinit(A);
+
+    var ws_actual = try Workspace.init(A, skel);
+    defer ws_actual.deinit(A);
+
+    var ws_reference = try Workspace.init(A, skel);
+    defer ws_reference.deinit(A);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = jog, .time_seconds = 0.10, .wrap_time = true, .weight = 0.20, .mode = .normal },
+        .{ .anim = walk, .time_seconds = 0.25, .wrap_time = true, .weight = 0.35, .mode = .normal },
+        .{ .anim = run, .time_seconds = 0.40, .wrap_time = true, .weight = 0.45, .mode = .normal },
+    });
+
+    const actual = try copyPalette(A, try evalModel3x4(&inst, &ws_actual));
+    defer A.free(actual);
+
+    const reference = try evalModel3x4Reference(&inst, &ws_reference);
+    try expectSlicesApproxEqAbs(reference, actual, 1e-4);
+}
+
+test "evalModel3x4 matches upstream reference for additive hand poses" {
+    const A = std.testing.allocator;
+
+    var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
+    defer skel.deinit();
+
+    var walk = try Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
+    defer walk.deinit();
+
+    var curl = try Animation.loadFromFileZ("assets/pab_curl_additive.ozz");
+    defer curl.deinit();
+
+    var splay = try Animation.loadFromFileZ("assets/pab_splay_additive.ozz");
+    defer splay.deinit();
+
+    var inst = try Instance.init(A, skel);
+    defer inst.deinit(A);
+
+    var ws_actual = try Workspace.init(A, skel);
+    defer ws_actual.deinit(A);
+
+    var ws_reference = try Workspace.init(A, skel);
+    defer ws_reference.deinit(A);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
+        .{ .anim = curl, .time_seconds = 0.0, .wrap_time = true, .weight = 0.30, .mode = .additive },
+        .{ .anim = splay, .time_seconds = 0.0, .wrap_time = true, .weight = 0.90, .mode = .additive },
+    });
+
+    const actual = try copyPalette(A, try evalModel3x4(&inst, &ws_actual));
+    defer A.free(actual);
+
+    const reference = try evalModel3x4Reference(&inst, &ws_reference);
+    try expectSlicesApproxEqAbs(reference, actual, 1e-4);
+}
+
+test "evalModel3x4 matches upstream reference for negative additive weights" {
+    const A = std.testing.allocator;
+
+    var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
+    defer skel.deinit();
+
+    var walk = try Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
+    defer walk.deinit();
+
+    var curl = try Animation.loadFromFileZ("assets/pab_curl_additive.ozz");
+    defer curl.deinit();
+
+    var inst = try Instance.init(A, skel);
+    defer inst.deinit(A);
+
+    var ws_actual = try Workspace.init(A, skel);
+    defer ws_actual.deinit(A);
+
+    var ws_reference = try Workspace.init(A, skel);
+    defer ws_reference.deinit(A);
+
+    inst.setLayers(&[_]Layer{
+        .{ .anim = walk, .time_seconds = 0.10, .wrap_time = true, .weight = 1.0, .mode = .normal },
+        .{ .anim = curl, .time_seconds = 0.0, .wrap_time = true, .weight = -0.50, .mode = .additive },
+    });
+
+    const actual = try copyPalette(A, try evalModel3x4(&inst, &ws_actual));
+    defer A.free(actual);
+
+    const reference = try evalModel3x4Reference(&inst, &ws_reference);
+    try expectSlicesApproxEqAbs(reference, actual, 1e-4);
 }
