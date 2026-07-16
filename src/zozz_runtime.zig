@@ -52,7 +52,7 @@ comptime {
     }
 }
 
-var g_ozz_allocator_lock: std.Thread.Mutex = .{};
+var g_ozz_allocator_lock: std.atomic.Mutex = .unlocked;
 var g_ozz_allocator: ?std.mem.Allocator = null;
 var g_ozz_outstanding_allocations: usize = 0;
 
@@ -65,13 +65,17 @@ fn currentOzzAllocator() ?std.mem.Allocator {
     return g_ozz_allocator;
 }
 
+fn lockOzzAllocator() void {
+    while (!g_ozz_allocator_lock.tryLock()) std.atomic.spinLoopHint();
+}
+
 fn ensureAllocatorInstalled() std.mem.Allocator {
     return currentOzzAllocator() orelse @panic("zozz allocator callback invoked without installAllocator()");
 }
 
 fn ozzAllocCallback(user_data: ?*anyopaque, size: usize, alignment: usize) callconv(.c) ?*anyopaque {
     _ = user_data;
-    g_ozz_allocator_lock.lock();
+    lockOzzAllocator();
     defer g_ozz_allocator_lock.unlock();
 
     const allocator = ensureAllocatorInstalled();
@@ -100,7 +104,7 @@ fn ozzFreeCallback(user_data: ?*anyopaque, ptr: ?*anyopaque) callconv(.c) void {
     _ = user_data;
     if (ptr == null) return;
 
-    g_ozz_allocator_lock.lock();
+    lockOzzAllocator();
     defer g_ozz_allocator_lock.unlock();
 
     const allocator = ensureAllocatorInstalled();
@@ -117,7 +121,7 @@ fn ozzFreeCallback(user_data: ?*anyopaque, ptr: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn installAllocator(allocator: std.mem.Allocator) AllocatorError!void {
-    g_ozz_allocator_lock.lock();
+    lockOzzAllocator();
     defer g_ozz_allocator_lock.unlock();
 
     if (g_ozz_outstanding_allocations != 0) return AllocatorError.OzzAllocatorBusy;
@@ -126,7 +130,7 @@ pub fn installAllocator(allocator: std.mem.Allocator) AllocatorError!void {
 }
 
 pub fn resetAllocator() AllocatorError!void {
-    g_ozz_allocator_lock.lock();
+    lockOzzAllocator();
     defer g_ozz_allocator_lock.unlock();
 
     if (g_ozz_outstanding_allocations != 0) return AllocatorError.OzzAllocatorBusy;
@@ -338,7 +342,7 @@ pub const Instance = struct {
 
     pub fn init(allocator: std.mem.Allocator, skel: Skeleton) !Instance {
         const bytes = skel.instanceBytes();
-        const storage = try allocator.alignedAlloc(u8, 16, bytes);
+        const storage = try allocator.alignedAlloc(u8, .fromByteUnits(16), bytes);
         errdefer allocator.free(storage);
 
         var out: ?*c.ozz_instance_t = null;
@@ -416,7 +420,7 @@ pub const Workspace = struct {
 
     pub fn init(allocator: std.mem.Allocator, skel: Skeleton) !Workspace {
         const bytes = skel.workspaceBytes();
-        const storage = try allocator.alignedAlloc(u8, 16, bytes);
+        const storage = try allocator.alignedAlloc(u8, .fromByteUnits(16), bytes);
         errdefer allocator.free(storage);
 
         var out: ?*c.ozz_workspace_t = null;

@@ -1,44 +1,33 @@
 .{
     .name = .zozz,
     .fingerprint = 0x34d1aa7660ee962,
-    .version = "0.14.0",
-    .minimum_zig_version = "0.14.0",
+    .version = "0.16.0",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zglfw = .{
-            .url = "https://github.com/zig-gamedev/zglfw/archive/88552fb644b1da55faf92a9ac13d6455d50349ef.tar.gz",
-            .hash = "zglfw-0.10.0-dev-zgVDNJaZIQA_apqUeB7ucb7MH7HuXyQHSrXOqkqN-lnT",
+            .url = "https://github.com/zig-gamedev/zglfw/archive/51003c105d23db378bb59ce415a387b22f1b0892.tar.gz",
+            .hash = "zglfw-0.10.0-dev-zgVDNIy4IQDJNRy4jrP1As-SZxfJpuWhU1iJ-wBab_VD",
         },
         .zgpu = .{
-            .url = "https://github.com/zig-gamedev/zgpu/archive/96f3ce2229e4836daec714a3f0b8c3c3218a6b2c.tar.gz",
-            .hash = "zgpu-0.12.0-dev-nqFT5LqgCACR_1wEhi7rveY3ocKJczfRaXQoisCmpohn",
+            .url = "https://github.com/a-day-old-bagel/zgpu/archive/0d1f7f7116435a262fb6997f4ef31e64409cdc67.tar.gz",
+            .hash = "zgpu-0.16.0-dev-nqFT5IzVBgDIsQ75TPBIB9bMe5iFkz9o2cgA7Hgb31OA",
         },
         .zmath = .{
-            .url = "https://github.com/zig-gamedev/zmath/archive/1745b6a7a4b9d275c4c948fbbb03568b8c72617d.tar.gz",
-            .hash = "zmath-0.11.0-dev-wjwiva80AwAYXBoySNnvX3FiQqrs8TcupymM9pHauLbN",
+            .url = "https://github.com/zig-gamedev/zmath/archive/9e42b04a24c970a297b365f3d3022f92dbf3219d.tar.gz",
+            .hash = "zmath-0.11.0-dev-wjwivTwtAwDOjG2_KGP-HLtHrONfsFfHttalmxFAGVAK",
         },
-        .dawn_x86_64_windows_gnu = .{
-            .url = "https://github.com/michal-z/webgpu_dawn-x86_64-windows-gnu/archive/d3a68014e6b6b53fd330a0ccba99e4dcfffddae5.tar.gz",
-            .hash = "N-V-__8AAGsYnAT5RIzeAu881RveLghQ1EidqgVBVx10gVTo",
+        .zwindows = .{
+            .url = "https://github.com/zig-gamedev/zwindows/archive/623c15d109ed1f900597a6c8f1372465a4bd9d0f.tar.gz",
+            .hash = "zwindows-0.2.0-dev-xMZ1u_h5yQaHTycqsygTEa3Ca7aplFIaF7gJAEa2_kID",
+        },
+        .zdawn_x86_64_windows_gnu = .{
+            .url = "https://github.com/a-day-old-bagel/libzdawn-binaries/archive/6f4aa6f43f79eb200b0c865907f62a8a95310786.tar.gz",
+            .hash = "zdawn_x86_64_windows_gnu-0.14.0-dev-3fGi06kj7AGhszK_2GGSLYhxe8AAI3h8NgrREPQxdjZy",
             .lazy = true,
         },
-        .dawn_x86_64_linux_gnu = .{
-            .url = "https://github.com/michal-z/webgpu_dawn-x86_64-linux-gnu/archive/7d70db023bf254546024629cbec5ee6113e12a42.tar.gz",
-            .hash = "N-V-__8AAK7XUQNKNRnv1J6i189jtURJKjp3HTftoyD4Y4CB",
-            .lazy = true,
-        },
-        .dawn_aarch64_linux_gnu = .{
-            .url = "https://github.com/michal-z/webgpu_dawn-aarch64-linux-gnu/archive/c1f55e740a62f6942ff046e709ecd509a005dbeb.tar.gz",
-            .hash = "N-V-__8AAJ-wTwNc0T9oSflO92iO6IxrdMeRil37UU-KQD_M",
-            .lazy = true,
-        },
-        .dawn_aarch64_macos = .{
-            .url = "https://github.com/michal-z/webgpu_dawn-aarch64-macos/archive/d2360cdfff0cf4a780cb77aa47c57aca03cc6dfe.tar.gz",
-            .hash = "N-V-__8AALVIRAIf5nfpx8-4mEo2RGsynVryPQPcHk95qFM5",
-            .lazy = true,
-        },
-        .dawn_x86_64_macos = .{
-            .url = "https://github.com/michal-z/webgpu_dawn-x86_64-macos/archive/901716b10b31ce3e0d3fe479326b41e91d59c661.tar.gz",
-            .hash = "N-V-__8AAIz1QAKx8C8vft2YoHjGTjEAkH2QMR2UiAo8xZJ-",
+        .zdawn_x86_64_linux_gnu = .{
+            .url = "https://github.com/a-day-old-bagel/libzdawn-binaries/archive/83a7c48136bef8bf7f54586f6a2444a627509679.tar.gz",
+            .hash = "zdawn_x86_64_linux_gnu-0.14.0-dev-uKseL9PnvAL-jlweix9fqtXH2M1Knu9oA8Aznjv6XwnG",
             .lazy = true,
         },
     },

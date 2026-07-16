@@ -162,7 +162,7 @@ fn init(allocator: std.mem.Allocator, window: *zglfw.Window) !DemoState {
 
     const bind_group_layout = gctx.createBindGroupLayout(&.{
         zgpu.bufferEntry(0, .{ .vertex = true }, .uniform, true, 0),
-    });
+    }, .{});
     defer gctx.releaseResource(bind_group_layout);
 
     const pipeline_layout = gctx.createPipelineLayout(&.{bind_group_layout});
@@ -176,7 +176,7 @@ fn init(allocator: std.mem.Allocator, window: *zglfw.Window) !DemoState {
         defer fs_module.release();
 
         const color_targets = [_]wgpu.ColorTargetState{.{
-            .format = zgpu.GraphicsContext.swapchain_format,
+            .format = zgpu.GraphicsContext.surface_texture_format,
         }};
 
         const vertex_attributes = [_]wgpu.VertexAttribute{
@@ -192,7 +192,7 @@ fn init(allocator: std.mem.Allocator, window: *zglfw.Window) !DemoState {
         const pipeline_descriptor = wgpu.RenderPipelineDescriptor{
             .vertex = wgpu.VertexState{
                 .module = vs_module,
-                .entry_point = "main",
+                .entry_point = wgpu.StringView.cFromZig("main"),
                 .buffer_count = vertex_buffers.len,
                 .buffers = &vertex_buffers,
             },
@@ -203,12 +203,12 @@ fn init(allocator: std.mem.Allocator, window: *zglfw.Window) !DemoState {
             },
             .depth_stencil = &wgpu.DepthStencilState{
                 .format = .depth32_float,
-                .depth_write_enabled = true,
+                .depth_write_enabled = wgpu.True,
                 .depth_compare = .less,
             },
             .fragment = &wgpu.FragmentState{
                 .module = fs_module,
-                .entry_point = "main",
+                .entry_point = wgpu.StringView.cFromZig("main"),
                 .target_count = color_targets.len,
                 .targets = &color_targets,
             },
@@ -302,8 +302,9 @@ fn deinit(allocator: std.mem.Allocator, demo: *DemoState) void {
 
 fn draw(demo: *DemoState) !void {
     const gctx = demo.gctx;
-    const fb_width = gctx.swapchain_descriptor.width;
-    const fb_height = gctx.swapchain_descriptor.height;
+    const framebuffer_size = gctx.window_provider.fn_getFramebufferSize(gctx.window_provider.window);
+    const fb_width: u32 = @intCast(framebuffer_size[0]);
+    const fb_height: u32 = @intCast(framebuffer_size[1]);
     const t: f32 = @floatCast(gctx.stats.time);
 
     const vertex_count = try updateSkeletonVertices(demo, t);
@@ -325,7 +326,11 @@ fn draw(demo: *DemoState) !void {
     );
     const object_to_clip = zm.mul(world_to_view, view_to_clip);
 
-    const back_buffer_view = gctx.swapchain.getCurrentTextureView();
+    var surface_texture: wgpu.SurfaceTexture = .{};
+    gctx.surface.getCurrentTexture(&surface_texture);
+    const back_buffer = surface_texture.texture orelse return;
+    defer back_buffer.release();
+    const back_buffer_view = back_buffer.createView(.{});
     defer back_buffer_view.release();
 
     const commands = commands: {
@@ -377,7 +382,7 @@ fn draw(demo: *DemoState) !void {
 
     gctx.submit(&.{commands});
 
-    if (gctx.present() == .swap_chain_resized) {
+    if (gctx.present() == .surface_reconfigured) {
         gctx.releaseResource(demo.depth_texture_view);
         gctx.destroyResource(demo.depth_texture);
 
@@ -904,12 +909,13 @@ fn createDepthTexture(gctx: *zgpu.GraphicsContext) struct {
     texture: zgpu.TextureHandle,
     view: zgpu.TextureViewHandle,
 } {
+    const framebuffer_size = gctx.window_provider.fn_getFramebufferSize(gctx.window_provider.window);
     const texture = gctx.createTexture(.{
         .usage = .{ .render_attachment = true },
         .dimension = .tdim_2d,
         .size = .{
-            .width = gctx.swapchain_descriptor.width,
-            .height = gctx.swapchain_descriptor.height,
+            .width = @intCast(framebuffer_size[0]),
+            .height = @intCast(framebuffer_size[1]),
             .depth_or_array_layers = 1,
         },
         .format = .depth32_float,
@@ -920,25 +926,23 @@ fn createDepthTexture(gctx: *zgpu.GraphicsContext) struct {
     return .{ .texture = texture, .view = view };
 }
 
-pub fn main() !void {
+pub fn main(process_init: std.process.Init) !void {
     try zglfw.init();
     defer zglfw.terminate();
 
     {
         var buffer: [1024]u8 = undefined;
-        const path = std.fs.selfExeDirPath(buffer[0..]) catch ".";
-        std.posix.chdir(path) catch {};
+        const path_len = std.process.executableDirPath(process_init.io, buffer[0..]) catch 1;
+        const path = if (path_len == 1) "." else buffer[0..path_len];
+        std.process.setCurrentPath(process_init.io, path) catch {};
     }
 
     zglfw.windowHint(.client_api, .no_api);
 
-    const window = try zglfw.createWindow(1400, 900, window_title, null);
+    const window = try zglfw.createWindow(1400, 900, window_title, null, null);
     defer window.destroy();
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-
-    const allocator = gpa.allocator();
+    const allocator = process_init.gpa;
 
     var demo = try init(allocator, window);
     defer deinit(allocator, &demo);

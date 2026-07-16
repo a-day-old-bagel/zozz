@@ -27,14 +27,16 @@ pub fn build(b: *std.Build) void {
     // C++
     //
 
-    const cozz_runtime = b.addStaticLibrary(.{
+    const cozz_runtime = b.addLibrary(.{
         .name = "cozz_runtime",
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        }),
     });
     b.installArtifact(cozz_runtime);
-    cozz_runtime.addIncludePath(b.path("ozz/include"));
-    cozz_runtime.addCSourceFiles(.{
+    cozz_runtime.root_module.addIncludePath(b.path("ozz/include"));
+    cozz_runtime.root_module.addCSourceFiles(.{
         .files = &.{
             "cozz/cozz_runtime.cpp",
 
@@ -46,18 +48,20 @@ pub fn build(b: *std.Build) void {
             "-fno-exceptions",
         },
     });
-    cozz_runtime.linkLibC();
-    cozz_runtime.linkLibCpp();
+    cozz_runtime.root_module.link_libc = true;
+    cozz_runtime.root_module.link_libcpp = true;
 
-    const cozz_offline = b.addStaticLibrary(.{
+    const cozz_offline = b.addLibrary(.{
         .name = "cozz_offline",
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        }),
     });
     b.installArtifact(cozz_offline);
-    cozz_offline.addIncludePath(b.path("ozz/include"));
-    cozz_offline.addIncludePath(b.path("libs"));
-    cozz_offline.addCSourceFiles(.{
+    cozz_offline.root_module.addIncludePath(b.path("ozz/include"));
+    cozz_offline.root_module.addIncludePath(b.path("libs"));
+    cozz_offline.root_module.addCSourceFiles(.{
         .files = &.{
             "cozz/cozz_offline.cpp",
 
@@ -70,8 +74,8 @@ pub fn build(b: *std.Build) void {
             "-std=c++20",
         },
     });
-    cozz_offline.linkLibC();
-    cozz_offline.linkLibCpp();
+    cozz_offline.root_module.link_libc = true;
+    cozz_offline.root_module.link_libcpp = true;
 
     //
     // Example
@@ -111,24 +115,28 @@ pub fn build(b: *std.Build) void {
 
     const tests_runtime = b.addTest(.{
         .name = "zozz_runtime_tests",
-        .root_source_file = b.path("src/zozz_runtime.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/zozz_runtime.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
     b.installArtifact(tests_runtime);
-    tests_runtime.addIncludePath(b.path("cozz"));
-    tests_runtime.linkLibrary(cozz_runtime);
+    tests_runtime.root_module.addIncludePath(b.path("cozz"));
+    tests_runtime.root_module.linkLibrary(cozz_runtime);
     test_step.dependOn(&b.addRunArtifact(tests_runtime).step);
 
     const tests_offline = b.addTest(.{
         .name = "zozz_offline_tests",
-        .root_source_file = b.path("src/zozz_offline.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/zozz_offline.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
     b.installArtifact(tests_offline);
-    tests_offline.addIncludePath(b.path("cozz"));
-    tests_offline.linkLibrary(cozz_offline);
+    tests_offline.root_module.addIncludePath(b.path("cozz"));
+    tests_offline.root_module.linkLibrary(cozz_offline);
     test_step.dependOn(&b.addRunArtifact(tests_offline).step);
 }
 
@@ -143,14 +151,14 @@ fn buildDebugSkeletonExample(b: *std.Build, options: ExampleOptions) *std.Build.
     });
 
     exe.root_module.addImport("zozz_runtime", options.zozz_runtime);
-    exe.linkLibrary(options.cozz_runtime);
+    exe.root_module.linkLibrary(options.cozz_runtime);
 
     const zglfw = b.dependency("zglfw", .{
         .target = options.target,
         .optimize = options.optimize,
     });
     exe.root_module.addImport("zglfw", zglfw.module("root"));
-    exe.linkLibrary(zglfw.artifact("glfw"));
+    exe.root_module.linkLibrary(zglfw.artifact("glfw"));
 
     @import("zgpu").addLibraryPathsTo(exe);
     const zgpu = b.dependency("zgpu", .{
@@ -158,7 +166,8 @@ fn buildDebugSkeletonExample(b: *std.Build, options: ExampleOptions) *std.Build.
         .optimize = options.optimize,
     });
     exe.root_module.addImport("zgpu", zgpu.module("root"));
-    exe.linkLibrary(zgpu.artifact("zdawn"));
+    exe.root_module.linkLibrary(zgpu.artifact("zdawn"));
+    @import("zgpu").installDxcFrom(exe, "zwindows");
 
     const zmath = b.dependency("zmath", .{
         .target = options.target,
