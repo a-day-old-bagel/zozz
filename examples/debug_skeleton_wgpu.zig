@@ -5,6 +5,7 @@ const zgpu = @import("zgpu");
 const wgpu = zgpu.wgpu;
 const zm = @import("zmath");
 const zozz = @import("zozz_runtime");
+const zozz_mesh = @import("zozz_mesh");
 
 const window_title = "zozz: debug skeleton (wgpu)";
 const target_marker_half_extent = 0.08;
@@ -54,12 +55,13 @@ const AxisChoice = enum(u8) {
 const Controls = struct {
     auto_blend: bool = true,
     blend: f32 = 0.0,
-    enable_additive: bool = true,
-    enable_head_aim: bool = true,
-    enable_arm_ik: bool = true,
+    enable_additive: bool = false,
+    enable_head_aim: bool = false,
+    enable_arm_ik: bool = false,
     orbit_camera: bool = true,
-    show_target: bool = true,
+    show_target: bool = false,
     show_joint_axes: bool = true,
+    show_mesh: bool = true,
     arm_weight: f32 = 0.95,
     arm_soften: f32 = 0.60,
     head_weight: f32 = 0.75,
@@ -82,6 +84,7 @@ const InputState = struct {
     toggle_target: bool = false,
     toggle_orbit_camera: bool = false,
     toggle_joint_axes: bool = false,
+    toggle_mesh: bool = false,
     cycle_elbow_axis: bool = false,
     cycle_arm_pole_axis: bool = false,
     cycle_head_forward_axis: bool = false,
@@ -116,21 +119,25 @@ const ArmChain = struct {
 const DemoState = struct {
     gctx: *zgpu.GraphicsContext,
     pipeline: zgpu.RenderPipelineHandle,
+    mesh_pipeline: zgpu.RenderPipelineHandle,
     bind_group: zgpu.BindGroupHandle,
     vertex_buffer: zgpu.BufferHandle,
+    mesh_vertex_buffer: zgpu.BufferHandle,
+    mesh_index_buffer: zgpu.BufferHandle,
     depth_texture: zgpu.TextureHandle,
     depth_texture_view: zgpu.TextureViewHandle,
 
     skeleton: zozz.Skeleton,
     walk: zozz.Animation,
     run: zozz.Animation,
-    curl: zozz.Animation,
-    splay: zozz.Animation,
     inst: zozz.Instance,
     ws: zozz.Workspace,
 
     joint_parents: []i32,
     line_vertices: []Vertex,
+    mesh: zozz_mesh.Mesh,
+    skinned_vertices: []zozz_mesh.SkinnedVertex,
+    mesh_vertices: []Vertex,
 
     head_joint: i32,
     arm_chain: ArmChain,
@@ -142,7 +149,7 @@ const DemoState = struct {
     last_sample_time: ?f32,
 };
 
-fn init(allocator: std.mem.Allocator, window: *zglfw.Window) !DemoState {
+fn init(allocator: std.mem.Allocator, io: std.Io, window: *zglfw.Window) !DemoState {
     const gctx = try zgpu.GraphicsContext.create(
         allocator,
         .{
@@ -215,25 +222,20 @@ fn init(allocator: std.mem.Allocator, window: *zglfw.Window) !DemoState {
         };
         break :pipeline gctx.createRenderPipeline(pipeline_layout, pipeline_descriptor);
     };
+    const mesh_pipeline = createColorPipeline(gctx, pipeline_layout, .triangle_list);
 
     const bind_group = gctx.createBindGroup(bind_group_layout, &.{
         .{ .binding = 0, .buffer_handle = gctx.uniforms.buffer, .offset = 0, .size = @sizeOf(zm.Mat) },
     });
 
-    var skeleton = try zozz.Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
+    var skeleton = try zozz.Skeleton.loadFromFileZ("assets/ual_skeleton.ozz");
     errdefer skeleton.deinit();
 
-    var walk = try zozz.Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
+    var walk = try zozz.Animation.loadFromFileZ("assets/ual_walk.ozz");
     errdefer walk.deinit();
 
-    var run = try zozz.Animation.loadFromFileZ("assets/pab_run_no_motion.ozz");
+    var run = try zozz.Animation.loadFromFileZ("assets/ual_run.ozz");
     errdefer run.deinit();
-
-    var curl = try zozz.Animation.loadFromFileZ("assets/pab_curl_additive.ozz");
-    errdefer curl.deinit();
-
-    var splay = try zozz.Animation.loadFromFileZ("assets/pab_splay_additive.ozz");
-    errdefer splay.deinit();
 
     var inst = try zozz.Instance.init(allocator, skeleton);
     errdefer inst.deinit(allocator);
@@ -256,25 +258,39 @@ fn init(allocator: std.mem.Allocator, window: *zglfw.Window) !DemoState {
         .usage = .{ .copy_dst = true, .vertex = true },
         .size = @sizeOf(Vertex) * line_vertices.len,
     });
+    var mesh = try zozz_mesh.Mesh.loadFromFile(allocator, io, "assets/ual_mesh.zmesh");
+    errdefer mesh.deinit(allocator);
+    if (mesh.jointCount() != joint_count) return error.MeshSkeletonMismatch;
+    const skinned_vertices = try allocator.alloc(zozz_mesh.SkinnedVertex, mesh.vertices.len);
+    errdefer allocator.free(skinned_vertices);
+    const mesh_vertices = try allocator.alloc(Vertex, mesh.vertices.len);
+    errdefer allocator.free(mesh_vertices);
+    const mesh_vertex_buffer = gctx.createBuffer(.{ .usage = .{ .copy_dst = true, .vertex = true }, .size = @sizeOf(Vertex) * mesh_vertices.len });
+    const mesh_index_buffer = gctx.createBuffer(.{ .usage = .{ .copy_dst = true, .index = true }, .size = @sizeOf(u32) * mesh.indices.len });
+    gctx.queue.writeBuffer(gctx.lookupResource(mesh_index_buffer).?, 0, u32, mesh.indices);
 
     const depth = createDepthTexture(gctx);
 
     return .{
         .gctx = gctx,
         .pipeline = pipeline,
+        .mesh_pipeline = mesh_pipeline,
         .bind_group = bind_group,
         .vertex_buffer = vertex_buffer,
+        .mesh_vertex_buffer = mesh_vertex_buffer,
+        .mesh_index_buffer = mesh_index_buffer,
         .depth_texture = depth.texture,
         .depth_texture_view = depth.view,
         .skeleton = skeleton,
         .walk = walk,
         .run = run,
-        .curl = curl,
-        .splay = splay,
         .inst = inst,
         .ws = ws,
         .joint_parents = joint_parents,
         .line_vertices = line_vertices,
+        .mesh = mesh,
+        .skinned_vertices = skinned_vertices,
+        .mesh_vertices = mesh_vertices,
         .head_joint = skeleton.findJointZ("Head"),
         .arm_chain = resolveArmChain(skeleton),
         .controls = .{},
@@ -287,12 +303,13 @@ fn init(allocator: std.mem.Allocator, window: *zglfw.Window) !DemoState {
 }
 
 fn deinit(allocator: std.mem.Allocator, demo: *DemoState) void {
+    allocator.free(demo.mesh_vertices);
+    allocator.free(demo.skinned_vertices);
+    demo.mesh.deinit(allocator);
     allocator.free(demo.line_vertices);
     allocator.free(demo.joint_parents);
     demo.ws.deinit(allocator);
     demo.inst.deinit(allocator);
-    demo.splay.deinit();
-    demo.curl.deinit();
     demo.run.deinit();
     demo.walk.deinit();
     demo.skeleton.deinit();
@@ -311,6 +328,10 @@ fn draw(demo: *DemoState) !void {
     if (vertex_count > 0) {
         const vertex_buffer = gctx.lookupResource(demo.vertex_buffer) orelse return;
         gctx.queue.writeBuffer(vertex_buffer, 0, Vertex, demo.line_vertices[0..vertex_count]);
+    }
+    if (demo.controls.show_mesh) {
+        const mesh_vertex_buffer = gctx.lookupResource(demo.mesh_vertex_buffer) orelse return;
+        gctx.queue.writeBuffer(mesh_vertex_buffer, 0, Vertex, demo.mesh_vertices);
     }
 
     const orbit = if (demo.controls.orbit_camera) 0.25 * t else 0.0;
@@ -367,13 +388,24 @@ fn draw(demo: *DemoState) !void {
             }
 
             pass.setVertexBuffer(0, vb_info.gpuobj.?, 0, vb_info.size);
-            pass.setPipeline(pipeline);
 
             const mem = gctx.uniformsAllocate(zm.Mat, 1);
             mem.slice[0] = zm.transpose(object_to_clip);
 
             pass.setBindGroup(0, bind_group, &.{mem.offset});
-            pass.draw(@intCast(vertex_count), 1, 0, 0);
+            if (demo.controls.show_mesh) {
+                const mesh_vb = gctx.lookupResourceInfo(demo.mesh_vertex_buffer) orelse break :pass;
+                const mesh_ib = gctx.lookupResourceInfo(demo.mesh_index_buffer) orelse break :pass;
+                const mesh_pipeline = gctx.lookupResource(demo.mesh_pipeline) orelse break :pass;
+                pass.setVertexBuffer(0, mesh_vb.gpuobj.?, 0, mesh_vb.size);
+                pass.setIndexBuffer(mesh_ib.gpuobj.?, .uint32, 0, mesh_ib.size);
+                pass.setPipeline(mesh_pipeline);
+                pass.drawIndexed(@intCast(demo.mesh.indices.len), 1, 0, 0, 0);
+            } else {
+                pass.setVertexBuffer(0, vb_info.gpuobj.?, 0, vb_info.size);
+                pass.setPipeline(pipeline);
+                pass.draw(@intCast(vertex_count), 1, 0, 0);
+            }
         }
 
         break :commands encoder.finish(null);
@@ -411,14 +443,9 @@ fn updateSkeletonVertices(demo: *DemoState, time_seconds: f32) !usize {
     demo.locomotion_phase = @mod(demo.locomotion_phase + dt * locomotion_frequency, 1.0);
     const locomotion_phase = demo.locomotion_phase;
 
-    const curl_weight = if (demo.controls.enable_additive) @max(0.0, @sin(time_seconds) - 0.5) * 2.0 else 0.0;
-    const splay_weight = if (demo.controls.enable_additive) @min(0.0, @sin(-time_seconds) - 0.5) * 2.0 else 0.0;
-
     demo.inst.setLayers(&[_]zozz.Layer{
         zozz.Layer.atRatio(demo.walk, locomotion_phase, 1.0 - blend, .normal),
         zozz.Layer.atRatio(demo.run, locomotion_phase, blend, .normal),
-        zozz.Layer.atRatio(demo.curl, 0.0, curl_weight, .additive),
-        zozz.Layer.atRatio(demo.splay, 0.0, splay_weight, .additive),
     });
     demo.inst.setIkJobs(&.{});
 
@@ -469,6 +496,10 @@ fn updateSkeletonVertices(demo: *DemoState, time_seconds: f32) !usize {
 
     demo.inst.setIkJobs(jobs[0..job_count]);
     const palette = try zozz.evalModel3x4(&demo.inst, &demo.ws);
+    try demo.mesh.skin(palette, demo.skinned_vertices);
+    for (demo.skinned_vertices, demo.mesh_vertices) |source, *target| {
+        target.* = .{ .position = source.position, .color = source.color };
+    }
 
     var vertex_count: usize = 0;
     for (demo.joint_parents, 0..) |parent, joint| {
@@ -541,6 +572,14 @@ fn updateSkeletonVertices(demo: *DemoState, time_seconds: f32) !usize {
 }
 
 fn resolveArmChain(skeleton: zozz.Skeleton) ArmChain {
+    const ual_left = ArmChain{
+        .side_label = "Left",
+        .start_joint = skeleton.findJointZ("upperarm_l"),
+        .mid_joint = skeleton.findJointZ("lowerarm_l"),
+        .end_joint = skeleton.findJointZ("hand_l"),
+    };
+    if (ual_left.isValid()) return ual_left;
+
     const left = ArmChain{
         .side_label = "Left",
         .start_joint = skeleton.findJointZ("LeftArm"),
@@ -625,7 +664,7 @@ fn onOff(value: bool) []const u8 {
 fn printControls() void {
     std.debug.print(
         \\Controls:
-        \\  1 auto blend   2 additive   3 arm IK   4 head aim   5 target marker   6 orbit camera   7 joint axes
+        \\  M mesh/skeleton   1 auto blend   3 arm IK   4 head aim   5 target marker   6 orbit camera   7 joint axes
         \\  Q elbow axis   Y arm pole axis   W head forward axis   E head up axis
         \\  A/D blend      S/F arm weight        G/H arm soften
         \\  X/C head weight
@@ -679,6 +718,11 @@ fn handleInput(window: *zglfw.Window, demo: *DemoState) void {
     }
 
     var changed = false;
+
+    if (consumeEdge(window, .m, &demo.input.toggle_mesh)) {
+        demo.controls.show_mesh = !demo.controls.show_mesh;
+        changed = true;
+    }
 
     if (consumeEdge(window, .space, &demo.input.reset_controls)) {
         demo.controls = .{};
@@ -774,9 +818,10 @@ fn updateWindowTitle(window: *zglfw.Window, demo: *const DemoState) void {
     var buffer: [256]u8 = undefined;
     const title = std.fmt.bufPrintZ(
         &buffer,
-        "{s} | blend {d:.2} | arm {s} {d:.2} s{d:.2} d{d:.3} | pole {s} | head {s} {d:.2} | add {s} | axes {s} | elbow {s}",
+        "{s} | view {s} | blend {d:.2} | arm {s} {d:.2} s{d:.2} d{d:.3} | pole {s} | head {s} {d:.2} | axes {s} | elbow {s}",
         .{
             window_title,
+            if (demo.controls.show_mesh) "mesh" else "skeleton",
             demo.controls.blend,
             onOff(demo.controls.enable_arm_ik),
             demo.controls.arm_weight,
@@ -785,7 +830,6 @@ fn updateWindowTitle(window: *zglfw.Window, demo: *const DemoState) void {
             axisChoiceLabel(demo.controls.arm_pole_axis),
             onOff(demo.controls.enable_head_aim),
             demo.controls.head_weight,
-            onOff(demo.controls.enable_additive),
             onOff(demo.controls.show_joint_axes),
             axisChoiceLabel(demo.controls.elbow_axis),
         },
@@ -905,6 +949,25 @@ fn toVec3(v: [3]f32) zozz.Vec3 {
     return .{ .x = v[0], .y = v[1], .z = v[2] };
 }
 
+fn createColorPipeline(gctx: *zgpu.GraphicsContext, layout: zgpu.PipelineLayoutHandle, topology: wgpu.PrimitiveTopology) zgpu.RenderPipelineHandle {
+    const vs_module = zgpu.createWgslShaderModule(gctx.device, wgsl_vs, "mesh-vs");
+    defer vs_module.release();
+    const fs_module = zgpu.createWgslShaderModule(gctx.device, wgsl_fs, "mesh-fs");
+    defer fs_module.release();
+    const color_targets = [_]wgpu.ColorTargetState{.{ .format = zgpu.GraphicsContext.surface_texture_format }};
+    const vertex_attributes = [_]wgpu.VertexAttribute{
+        .{ .format = .float32x3, .offset = 0, .shader_location = 0 },
+        .{ .format = .float32x3, .offset = @offsetOf(Vertex, "color"), .shader_location = 1 },
+    };
+    const vertex_buffers = [_]wgpu.VertexBufferLayout{.{ .array_stride = @sizeOf(Vertex), .attribute_count = vertex_attributes.len, .attributes = &vertex_attributes }};
+    return gctx.createRenderPipeline(layout, .{
+        .vertex = .{ .module = vs_module, .entry_point = wgpu.StringView.cFromZig("main"), .buffer_count = vertex_buffers.len, .buffers = &vertex_buffers },
+        .primitive = .{ .front_face = .ccw, .cull_mode = .none, .topology = topology },
+        .depth_stencil = &.{ .format = .depth32_float, .depth_write_enabled = wgpu.True, .depth_compare = .less },
+        .fragment = &.{ .module = fs_module, .entry_point = wgpu.StringView.cFromZig("main"), .target_count = color_targets.len, .targets = &color_targets },
+    });
+}
+
 fn createDepthTexture(gctx: *zgpu.GraphicsContext) struct {
     texture: zgpu.TextureHandle,
     view: zgpu.TextureViewHandle,
@@ -944,7 +1007,7 @@ pub fn main(process_init: std.process.Init) !void {
 
     const allocator = process_init.gpa;
 
-    var demo = try init(allocator, window);
+    var demo = try init(allocator, process_init.io, window);
     defer deinit(allocator, &demo);
     printControls();
     printResolvedJoints(&demo);

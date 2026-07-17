@@ -41,12 +41,33 @@ importer supports `.glb`, `.gltf` with an external buffer, and base64 data-URI
 buffers. Animation accessors must use float components and `LINEAR`
 interpolation. Joint rest poses must currently be expressed as TRS; node
 `matrix` transforms, sparse accessors, cubic-spline/step interpolation, morph
-animation, mesh conversion, and retargeting are not yet supported.
+animation, and retargeting are not yet supported.
+
+Skinned mesh compilation is available separately from the standard ozz
+skeleton and animation archives:
+
+```sh
+zig-out/bin/zozz-import --mesh character.glb character.zmesh
+```
+
+`.zmesh` is a small zozz-owned runtime format, not an upstream ozz archive. It
+stores triangle indices, positions, normals, UV0, four joint indices and
+weights per vertex, primitive base colors, and inverse-bind matrices. Joint
+indices are remapped to the same depth-first order used by the compiled ozz
+skeleton. The initial compiler imports the first mesh and first skin, requires
+`POSITION`, `NORMAL`, `TEXCOORD_0`, `JOINTS_0`, and `WEIGHTS_0`, and supports
+unsigned-byte/unsigned-short joints and indices. Textures, tangents, morph
+targets, multiple skins, and general material conversion are not yet included.
 
 Direct FBX import is not built in. Ozz's bundled FBX headers depend on the
 proprietary Autodesk FBX SDK, but neither that SDK nor its implementation is
 included here. Convert FBX to glTF/GLB with a tool such as Blender first, then
 run `zozz-import`. This keeps zozz's normal build redistributable and offline.
+
+The graphical demo uses the bundled UAL skeleton, walk/run clips, and compiled
+mesh. It CPU-skins the mesh using the sampled ozz model-space palette and
+inverse binds. Press `M` to switch directly between the mesh and debug-skeleton
+views of the same pose.
 
 Graphical example dependencies are optional so offline-only builds do not try
 to fetch them. Use `zig build -Dexamples=true debug-skeleton` when those

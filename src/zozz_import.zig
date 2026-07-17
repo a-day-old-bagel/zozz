@@ -9,6 +9,10 @@ pub fn main(init: std.process.Init) !void {
         for (names, 0..) |name, i| std.debug.print("{d}: {s}\n", .{ i, name });
         return;
     }
+    if (args.len == 4 and std.mem.eql(u8, args[1], "--mesh")) {
+        try gltf.importMesh(allocator, init.io, args[2], args[3]);
+        return;
+    }
     if (args.len == 4 and std.mem.eql(u8, args[1], "--all")) {
         const names = try gltf.animationNames(allocator, init.io, args[2]);
         try std.Io.Dir.cwd().createDirPath(init.io, args[3]);
@@ -34,8 +38,8 @@ pub fn main(init: std.process.Init) !void {
 
 fn usage(exe: []const u8) error{InvalidArguments} {
     std.log.err(
-        "usage:\n  {s} --list <input.gltf|input.glb>\n  {s} --all <input.gltf|input.glb> <output-directory>\n  {s} <input> <skeleton.ozz> <animation.ozz> [animation-index-or-name]",
-        .{ exe, exe, exe },
+        "usage:\n  {s} --list <input.gltf|input.glb>\n  {s} --all <input.gltf|input.glb> <output-directory>\n  {s} --mesh <input.gltf|input.glb> <output.zmesh>\n  {s} <input> <skeleton.ozz> <animation.ozz> [animation-index-or-name]",
+        .{ exe, exe, exe, exe },
     );
     return error.InvalidArguments;
 }

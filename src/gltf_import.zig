@@ -98,7 +98,7 @@ fn readAccessor(allocator: std.mem.Allocator, root: std.json.ObjectMap, buffer: 
     if (try index(try field(accessor, "componentType")) != 5126) return error.UnsupportedGltf;
     const count = try index(try field(accessor, "count"));
     const kind = (try field(accessor, "type")).string;
-    const components: usize = if (std.mem.eql(u8, kind, "SCALAR")) 1 else if (std.mem.eql(u8, kind, "VEC3")) 3 else if (std.mem.eql(u8, kind, "VEC4")) 4 else return error.UnsupportedGltf;
+    const components: usize = if (std.mem.eql(u8, kind, "SCALAR")) 1 else if (std.mem.eql(u8, kind, "VEC2")) 2 else if (std.mem.eql(u8, kind, "VEC3")) 3 else if (std.mem.eql(u8, kind, "VEC4")) 4 else if (std.mem.eql(u8, kind, "MAT4")) 16 else return error.UnsupportedGltf;
     const view_index = try index(try field(accessor, "bufferView"));
     const views = (try field(root, "bufferViews")).array.items;
     if (view_index >= views.len or views[view_index] != .object) return error.InvalidGltf;
@@ -115,6 +115,142 @@ fn readAccessor(allocator: std.mem.Allocator, root: std.json.ObjectMap, buffer: 
         result[i * components + component] = @bitCast(std.mem.readInt(u32, buffer[offset..][0..4], .little));
     };
     return result;
+}
+
+const IntegerAccessor = struct { values: []u16, components: usize };
+
+fn readIntegerAccessor(allocator: std.mem.Allocator, root: std.json.ObjectMap, buffer: []const u8, accessor_index: usize) !IntegerAccessor {
+    const accessors = (try field(root, "accessors")).array.items;
+    if (accessor_index >= accessors.len or accessors[accessor_index] != .object) return error.InvalidGltf;
+    const accessor = accessors[accessor_index].object;
+    const component_type = try index(try field(accessor, "componentType"));
+    const component_bytes: usize = switch (component_type) { 5121 => 1, 5123 => 2, else => return error.UnsupportedGltf };
+    const count = try index(try field(accessor, "count"));
+    const kind = (try field(accessor, "type")).string;
+    const components: usize = if (std.mem.eql(u8, kind, "SCALAR")) 1 else if (std.mem.eql(u8, kind, "VEC4")) 4 else return error.UnsupportedGltf;
+    const view_index = try index(try field(accessor, "bufferView"));
+    const views = (try field(root, "bufferViews")).array.items;
+    if (view_index >= views.len or views[view_index] != .object) return error.InvalidGltf;
+    const view = views[view_index].object;
+    const view_offset = if (view.get("byteOffset")) |v| try index(v) else 0;
+    const accessor_offset = if (accessor.get("byteOffset")) |v| try index(v) else 0;
+    const packed_stride = components * component_bytes;
+    const stride = if (view.get("byteStride")) |v| try index(v) else packed_stride;
+    const start = view_offset + accessor_offset;
+    if (stride < packed_stride or start + (if (count == 0) 0 else (count - 1) * stride + packed_stride) > buffer.len) return error.InvalidGltf;
+    const result = try allocator.alloc(u16, count * components);
+    for (0..count) |i| for (0..components) |component| {
+        const offset = start + i * stride + component * component_bytes;
+        result[i * components + component] = if (component_bytes == 1) buffer[offset] else std.mem.readInt(u16, buffer[offset..][0..2], .little);
+    };
+    return .{ .values = result, .components = components };
+}
+
+pub fn importMesh(allocator: std.mem.Allocator, io: std.Io, input_path: []const u8, output_path: []const u8) !void {
+    const input = try std.Io.Dir.cwd().readFileAlloc(io, input_path, allocator, .unlimited);
+    const document = try parseDocument(allocator, input);
+    const root = document.root.object;
+    const binary = try readBuffer(allocator, io, input_path, document);
+    const nodes = (try field(root, "nodes")).array.items;
+    const skins = (try field(root, "skins")).array.items;
+    if (skins.len == 0) return error.NoSkin;
+    const skin = skins[0].object;
+    const skin_nodes = (try field(skin, "joints")).array.items;
+    const parents = try allocator.alloc(i32, nodes.len);
+    @memset(parents, -1);
+    for (nodes, 0..) |node_value, parent_index| if (node_value == .object and node_value.object.get("children") != null) {
+        for (node_value.object.get("children").?.array.items) |child| parents[try index(child)] = @intCast(parent_index);
+    };
+    const node_to_skin = try allocator.alloc(i32, nodes.len);
+    @memset(node_to_skin, -1);
+    for (skin_nodes, 0..) |node_value, i| node_to_skin[try index(node_value)] = @intCast(i);
+    const old_to_new = try allocator.alloc(i32, skin_nodes.len);
+    @memset(old_to_new, -1);
+    var written: usize = 0;
+    while (written < skin_nodes.len) {
+        var progress = false;
+        for (skin_nodes, 0..) |node_value, old_i| if (old_to_new[old_i] < 0) {
+            var p = parents[try index(node_value)];
+            while (p >= 0 and node_to_skin[@intCast(p)] < 0) p = parents[@intCast(p)];
+            if (p < 0 or old_to_new[@intCast(node_to_skin[@intCast(p)])] >= 0) {
+                old_to_new[old_i] = @intCast(written);
+                written += 1;
+                progress = true;
+            }
+        };
+        if (!progress) return error.InvalidGltf;
+    }
+    const inverse_accessor = skin.get("inverseBindMatrices") orelse return error.InvalidGltf;
+    const inverse_old = try readAccessor(allocator, root, binary, try index(inverse_accessor));
+    if (inverse_old.len != skin_nodes.len * 16) return error.InvalidGltf;
+    const inverse = try allocator.alloc(f32, inverse_old.len);
+    for (0..skin_nodes.len) |old_i| @memcpy(inverse[@as(usize, @intCast(old_to_new[old_i])) * 16 ..][0..16], inverse_old[old_i * 16 ..][0..16]);
+
+    const meshes = (try field(root, "meshes")).array.items;
+    if (meshes.len == 0) return error.InvalidGltf;
+    const primitives = (try field(meshes[0].object, "primitives")).array.items;
+    var vertex_count: usize = 0;
+    var index_count: usize = 0;
+    for (primitives) |primitive_value| {
+        const attributes = (try field(primitive_value.object, "attributes")).object;
+        const positions_accessor = (try field(root, "accessors")).array.items[try index(try field(attributes, "POSITION"))].object;
+        vertex_count += try index(try field(positions_accessor, "count"));
+        const index_accessor = (try field(root, "accessors")).array.items[try index(try field(primitive_value.object, "indices"))].object;
+        index_count += try index(try field(index_accessor, "count"));
+    }
+    const vertex_stride: usize = 68;
+    const header_size: usize = 24;
+    const total = header_size + vertex_count * vertex_stride + skin_nodes.len * 16 * 4 + index_count * 4;
+    const output = try allocator.alloc(u8, total);
+    @memset(output, 0);
+    @memcpy(output[0..4], "ZMSH");
+    std.mem.writeInt(u32, output[4..8], 1, .little);
+    std.mem.writeInt(u32, output[8..12], @intCast(vertex_count), .little);
+    std.mem.writeInt(u32, output[12..16], @intCast(index_count), .little);
+    std.mem.writeInt(u32, output[16..20], @intCast(skin_nodes.len), .little);
+    std.mem.writeInt(u32, output[20..24], @intCast(vertex_stride), .little);
+    var vertex_base: usize = 0;
+    var index_base: usize = 0;
+    for (primitives) |primitive_value| {
+        const primitive = primitive_value.object;
+        const attributes = (try field(primitive, "attributes")).object;
+        const positions = try readAccessor(allocator, root, binary, try index(try field(attributes, "POSITION")));
+        const normals = try readAccessor(allocator, root, binary, try index(try field(attributes, "NORMAL")));
+        const uvs = try readAccessor(allocator, root, binary, try index(try field(attributes, "TEXCOORD_0")));
+        const joints = try readIntegerAccessor(allocator, root, binary, try index(try field(attributes, "JOINTS_0")));
+        const weights = try readAccessor(allocator, root, binary, try index(try field(attributes, "WEIGHTS_0")));
+        const count = positions.len / 3;
+        if (normals.len != count * 3 or uvs.len != count * 2 or joints.values.len != count * 4 or weights.len != count * 4) return error.InvalidGltf;
+        var color = [3]f32{ 0.7, 0.7, 0.7 };
+        if (primitive.get("material")) |material_value| {
+            const materials = (try field(root, "materials")).array.items;
+            const material_i = try index(material_value);
+            if (material_i < materials.len) if (materials[material_i].object.get("pbrMetallicRoughness")) |pbr| if (pbr.object.get("baseColorFactor")) |factor| {
+                color = .{ try number(factor.array.items[0]), try number(factor.array.items[1]), try number(factor.array.items[2]) };
+            };
+        }
+        for (0..count) |v| {
+            const offset = header_size + (vertex_base + v) * vertex_stride;
+            var cursor = offset;
+            for (positions[v * 3 ..][0..3]) |value| { std.mem.writeInt(u32, output[cursor..][0..4], @bitCast(value), .little); cursor += 4; }
+            for (normals[v * 3 ..][0..3]) |value| { std.mem.writeInt(u32, output[cursor..][0..4], @bitCast(value), .little); cursor += 4; }
+            for (uvs[v * 2 ..][0..2]) |value| { std.mem.writeInt(u32, output[cursor..][0..4], @bitCast(value), .little); cursor += 4; }
+            for (joints.values[v * 4 ..][0..4]) |joint| { if (joint >= old_to_new.len) return error.InvalidGltf; std.mem.writeInt(u16, output[cursor..][0..2], @intCast(old_to_new[joint]), .little); cursor += 2; }
+            for (weights[v * 4 ..][0..4]) |value| { std.mem.writeInt(u32, output[cursor..][0..4], @bitCast(value), .little); cursor += 4; }
+            for (color) |value| { std.mem.writeInt(u32, output[cursor..][0..4], @bitCast(value), .little); cursor += 4; }
+        }
+        const indices = try readIntegerAccessor(allocator, root, binary, try index(try field(primitive, "indices")));
+        if (indices.components != 1) return error.InvalidGltf;
+        for (indices.values, 0..) |source_index, i| {
+            const offset = header_size + vertex_count * vertex_stride + skin_nodes.len * 64 + (index_base + i) * 4;
+            std.mem.writeInt(u32, output[offset..][0..4], @intCast(vertex_base + source_index), .little);
+        }
+        vertex_base += count;
+        index_base += indices.values.len;
+    }
+    var inverse_cursor = header_size + vertex_count * vertex_stride;
+    for (inverse) |value| { std.mem.writeInt(u32, output[inverse_cursor..][0..4], @bitCast(value), .little); inverse_cursor += 4; }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output_path, .data = output });
 }
 
 fn nodeTransform(node: std.json.ObjectMap) !offline.Transform {

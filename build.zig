@@ -4,6 +4,7 @@ const ExampleOptions = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     zozz_runtime: *std.Build.Module,
+    zozz_mesh: *std.Build.Module,
     cozz_runtime: *std.Build.Step.Compile,
 };
 
@@ -22,6 +23,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{},
     });
     zozz_offline.addIncludePath(b.path("cozz"));
+    const zozz_mesh = b.addModule("zozz_mesh", .{ .root_source_file = b.path("src/zozz_mesh.zig") });
 
     //
     // C++
@@ -100,9 +102,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .zozz_runtime = zozz_runtime,
+        .zozz_mesh = zozz_mesh,
         .cozz_runtime = cozz_runtime,
     });
     const install_debug_skeleton = b.addInstallArtifact(debug_skeleton, .{});
+    if (target.result.os.tag == .windows) {
+        const zwindows = b.lazyDependency("zwindows", .{}).?;
+        const install_dxcompiler = b.addInstallFileWithDir(zwindows.path("bin/x64/dxcompiler.dll"), .bin, "dxcompiler.dll");
+        const install_dxil = b.addInstallFileWithDir(zwindows.path("bin/x64/dxil.dll"), .bin, "dxil.dll");
+        install_debug_skeleton.step.dependOn(&install_dxcompiler.step);
+        install_debug_skeleton.step.dependOn(&install_dxil.step);
+    }
 
     const install_assets = b.addInstallDirectory(.{
         .source_dir = b.path("assets"),
@@ -154,6 +164,16 @@ pub fn build(b: *std.Build) void {
     tests_offline.root_module.addIncludePath(b.path("cozz"));
     tests_offline.root_module.linkLibrary(cozz_offline);
     test_step.dependOn(&b.addRunArtifact(tests_offline).step);
+
+    const tests_mesh = b.addTest(.{
+        .name = "zozz_mesh_tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/zozz_mesh.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(tests_mesh).step);
 }
 
 fn buildDebugSkeletonExample(b: *std.Build, options: ExampleOptions) *std.Build.Step.Compile {
@@ -167,26 +187,27 @@ fn buildDebugSkeletonExample(b: *std.Build, options: ExampleOptions) *std.Build.
     });
 
     exe.root_module.addImport("zozz_runtime", options.zozz_runtime);
+    exe.root_module.addImport("zozz_mesh", options.zozz_mesh);
     exe.root_module.linkLibrary(options.cozz_runtime);
 
-    const zglfw = b.dependency("zglfw", .{
+    const zglfw = b.lazyDependency("zglfw", .{
         .target = options.target,
         .optimize = options.optimize,
-    });
+    }).?;
     exe.root_module.addImport("zglfw", zglfw.module("root"));
     exe.root_module.linkLibrary(zglfw.artifact("glfw"));
 
-    const zgpu = b.dependency("zgpu", .{
+    const zgpu = b.lazyDependency("zgpu", .{
         .target = options.target,
         .optimize = options.optimize,
-    });
+    }).?;
     exe.root_module.addImport("zgpu", zgpu.module("root"));
     exe.root_module.linkLibrary(zgpu.artifact("zdawn"));
 
-    const zmath = b.dependency("zmath", .{
+    const zmath = b.lazyDependency("zmath", .{
         .target = options.target,
         .optimize = options.optimize,
-    });
+    }).?;
     exe.root_module.addImport("zmath", zmath.module("root"));
 
     return exe;
