@@ -4,6 +4,7 @@
 #include <string>
 
 #include "ozz/animation/offline/animation_builder.h"
+#include "ozz/animation/offline/additive_animation_builder.h"
 #include "ozz/animation/offline/raw_animation.h"
 #include "ozz/animation/offline/raw_skeleton.h"
 #include "ozz/animation/offline/skeleton_builder.h"
@@ -84,9 +85,9 @@ ozz_offline_result_t ozz_offline_build_skeleton(
   return OZZ_OFFLINE_OK;
 }
 
-ozz_offline_result_t ozz_offline_build_animation(
+static ozz_offline_result_t build_animation(
     const char* name, float duration, const ozz_offline_track_t* tracks,
-    size_t track_count, const char* output_path) {
+    size_t track_count, const char* output_path, bool additive) {
   ozz_offline_clear_error();
   if (!name || (!tracks && track_count) || !output_path || duration <= 0.f)
     return fail(OZZ_OFFLINE_ERR_INVALID_ARGUMENT, "invalid animation argument");
@@ -122,11 +123,31 @@ ozz_offline_result_t ozz_offline_build_animation(
   }
   if (!raw.Validate())
     return fail(OZZ_OFFLINE_ERR_INVALID_DATA, "invalid raw animation");
+  ozz::animation::offline::RawAnimation delta;
+  const ozz::animation::offline::RawAnimation* build_source = &raw;
+  if (additive) {
+    ozz::animation::offline::AdditiveAnimationBuilder additive_builder;
+    if (!additive_builder(raw, &delta))
+      return fail(OZZ_OFFLINE_ERR_INVALID_DATA, "additive conversion failed");
+    build_source = &delta;
+  }
   ozz::animation::offline::AnimationBuilder builder;
-  auto animation = builder(raw);
+  auto animation = builder(*build_source);
   if (!animation)
     return fail(OZZ_OFFLINE_ERR_INVALID_DATA, "animation build failed");
   if (!write_animation(output_path, *animation))
     return fail(OZZ_OFFLINE_ERR_IO, "could not write animation archive");
   return OZZ_OFFLINE_OK;
+}
+
+ozz_offline_result_t ozz_offline_build_animation(
+    const char* name, float duration, const ozz_offline_track_t* tracks,
+    size_t track_count, const char* output_path) {
+  return build_animation(name, duration, tracks, track_count, output_path, false);
+}
+
+ozz_offline_result_t ozz_offline_build_additive_animation(
+    const char* name, float duration, const ozz_offline_track_t* tracks,
+    size_t track_count, const char* output_path) {
+  return build_animation(name, duration, tracks, track_count, output_path, true);
 }

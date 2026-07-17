@@ -13,6 +13,11 @@ pub fn main(init: std.process.Init) !void {
         try gltf.importMesh(allocator, init.io, args[2], args[3]);
         return;
     }
+    if (args.len == 6 and std.mem.eql(u8, args[1], "--additive")) {
+        const animation_index = try resolveSelector(allocator, init.io, args[2], args[5]);
+        try gltf.importAdditive(allocator, init.io, args[2], args[3], args[4], animation_index);
+        return;
+    }
     if (args.len == 4 and std.mem.eql(u8, args[1], "--all")) {
         const names = try gltf.animationNames(allocator, init.io, args[2]);
         try std.Io.Dir.cwd().createDirPath(init.io, args[3]);
@@ -26,22 +31,24 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (args.len < 4 or args.len > 5) return usage(args[0]);
-    const animation_index = if (args.len == 5) selector: {
-        break :selector std.fmt.parseInt(usize, args[4], 10) catch {
-            const names = try gltf.animationNames(allocator, init.io, args[1]);
-            for (names, 0..) |name, i| if (std.mem.eql(u8, name, args[4])) break :selector i;
-            return error.InvalidAnimationName;
-        };
-    } else 0;
+    const animation_index = if (args.len == 5) try resolveSelector(allocator, init.io, args[1], args[4]) else 0;
     try gltf.import(allocator, init.io, args[1], args[2], args[3], animation_index);
 }
 
 fn usage(exe: []const u8) error{InvalidArguments} {
     std.log.err(
-        "usage:\n  {s} --list <input.gltf|input.glb>\n  {s} --all <input.gltf|input.glb> <output-directory>\n  {s} --mesh <input.gltf|input.glb> <output.zmesh>\n  {s} <input> <skeleton.ozz> <animation.ozz> [animation-index-or-name]",
-        .{ exe, exe, exe, exe },
+        "usage:\n  {s} --list <input.gltf|input.glb>\n  {s} --all <input.gltf|input.glb> <output-directory>\n  {s} --mesh <input.gltf|input.glb> <output.zmesh>\n  {s} --additive <input> <skeleton.ozz> <animation.ozz> <index-or-name>\n  {s} <input> <skeleton.ozz> <animation.ozz> [animation-index-or-name]",
+        .{ exe, exe, exe, exe, exe },
     );
     return error.InvalidArguments;
+}
+
+fn resolveSelector(allocator: std.mem.Allocator, io: std.Io, input_path: []const u8, selector: []const u8) !usize {
+    return std.fmt.parseInt(usize, selector, 10) catch {
+        const names = try gltf.animationNames(allocator, io, input_path);
+        for (names, 0..) |name, i| if (std.mem.eql(u8, name, selector)) return i;
+        return error.InvalidAnimationName;
+    };
 }
 
 fn safeFilename(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {

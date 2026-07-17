@@ -275,6 +275,14 @@ fn nodeTransform(node: std.json.ObjectMap) !offline.Transform {
 }
 
 pub fn import(allocator: std.mem.Allocator, io: std.Io, input_path: []const u8, skeleton_path: []const u8, animation_path: []const u8, animation_index: usize) !void {
+    return importAnimation(allocator, io, input_path, skeleton_path, animation_path, animation_index, false);
+}
+
+pub fn importAdditive(allocator: std.mem.Allocator, io: std.Io, input_path: []const u8, skeleton_path: []const u8, animation_path: []const u8, animation_index: usize) !void {
+    return importAnimation(allocator, io, input_path, skeleton_path, animation_path, animation_index, true);
+}
+
+fn importAnimation(allocator: std.mem.Allocator, io: std.Io, input_path: []const u8, skeleton_path: []const u8, animation_path: []const u8, animation_index: usize, additive: bool) !void {
     const input = try std.Io.Dir.cwd().readFileAlloc(io, input_path, allocator, .unlimited);
     const document = try parseDocument(allocator, input);
     const root = document.root.object;
@@ -395,5 +403,8 @@ pub fn import(allocator: std.mem.Allocator, io: std.Io, input_path: []const u8, 
     const animation_name = if (animation.get("name")) |v| v.string else "animation";
     const animation_name_z = try allocator.dupeZ(u8, animation_name);
     const animation_z = try allocator.dupeZ(u8, animation_path);
-    try offline.buildAnimation(animation_name_z.ptr, duration, tracks, animation_z.ptr);
+    if (additive)
+        try offline.buildAdditiveAnimation(animation_name_z.ptr, duration, tracks, animation_z.ptr)
+    else
+        try offline.buildAnimation(animation_name_z.ptr, duration, tracks, animation_z.ptr);
 }

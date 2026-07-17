@@ -33,6 +33,7 @@ name. Animation discovery and bulk extraction are also available:
 ```sh
 zig-out/bin/zozz-import --list character.glb
 zig-out/bin/zozz-import --all character.glb compiled-animations
+zig-out/bin/zozz-import --additive character.glb character-skeleton.ozz recoil.ozz Pistol_Shoot
 ```
 
 `--all` writes `skeleton.ozz` and one sanitized, name-based `.ozz` file per
@@ -64,10 +65,19 @@ proprietary Autodesk FBX SDK, but neither that SDK nor its implementation is
 included here. Convert FBX to glTF/GLB with a tool such as Blender first, then
 run `zozz-import`. This keeps zozz's normal build redistributable and offline.
 
-The graphical demo uses the bundled UAL skeleton, walk/run clips, and compiled
-mesh. It CPU-skins the mesh using the sampled ozz model-space palette and
-inverse binds. Press `M` to switch directly between the mesh and debug-skeleton
-views of the same pose.
+`--additive` converts an ordinary imported clip into delta tracks relative to
+its first frame using ozz's offline additive builder. Such clips must be played
+as additive layers; they are not meaningful as normal/base layers.
+
+The graphical demo uses the bundled UAL skeleton, walk/run clips, an
+upper-body-masked additive recoil clip, and compiled mesh. It CPU-skins the mesh
+using the sampled ozz model-space palette and inverse binds. Press `M` to
+switch directly between the mesh and debug-skeleton views of the same pose.
+The target marker and enabled IK joint bases remain visible as overlays in mesh
+mode. UAL-specific rest-pose axes are the defaults for head aim and arm IK.
+The arm pole direction is drawn from the shoulder in magenta while IK is
+enabled. `J`/`K` adjust the two-bone twist angle in 0.1-radian steps, making it
+possible to distinguish chain-plane selection from unsolved wrist orientation.
 
 Graphical example dependencies are optional so offline-only builds do not try
 to fetch them. Use `zig build -Dexamples=true debug-skeleton` when those

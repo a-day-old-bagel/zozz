@@ -59,21 +59,25 @@ const Controls = struct {
     enable_head_aim: bool = false,
     enable_arm_ik: bool = false,
     orbit_camera: bool = true,
-    show_target: bool = false,
+    show_target: bool = true,
     show_joint_axes: bool = true,
     show_mesh: bool = true,
     arm_weight: f32 = 0.95,
     arm_soften: f32 = 0.60,
+    arm_twist: f32 = 0.0,
     head_weight: f32 = 0.75,
     target_side: f32 = 0.08,
     target_lift: f32 = 0.25,
     target_forward: f32 = 0.25,
     target_sway: f32 = 0.10,
     target_bob: f32 = 0.08,
-    elbow_axis: AxisChoice = .pos_z,
-    arm_pole_axis: AxisChoice = .neg_y,
-    head_forward_axis: AxisChoice = .pos_y,
-    head_up_axis: AxisChoice = .pos_x,
+    // Derived from the UAL rest pose: the elbow's local +X maps to the
+    // model-space bend-plane normal, the arm bends toward -Z, and the head's
+    // local +Z/+Y axes are forward/up respectively.
+    elbow_axis: AxisChoice = .pos_x,
+    arm_pole_axis: AxisChoice = .neg_z,
+    head_forward_axis: AxisChoice = .pos_z,
+    head_up_axis: AxisChoice = .pos_y,
 };
 
 const InputState = struct {
@@ -95,6 +99,8 @@ const InputState = struct {
     arm_weight_up: bool = false,
     arm_soften_down: bool = false,
     arm_soften_up: bool = false,
+    arm_twist_down: bool = false,
+    arm_twist_up: bool = false,
     head_weight_down: bool = false,
     head_weight_up: bool = false,
     target_forward_down: bool = false,
@@ -130,14 +136,17 @@ const DemoState = struct {
     skeleton: zozz.Skeleton,
     walk: zozz.Animation,
     run: zozz.Animation,
+    recoil: zozz.Animation,
     inst: zozz.Instance,
     ws: zozz.Workspace,
 
     joint_parents: []i32,
+    upper_body_mask: []f32,
     line_vertices: []Vertex,
     mesh: zozz_mesh.Mesh,
     skinned_vertices: []zozz_mesh.SkinnedVertex,
     mesh_vertices: []Vertex,
+    overlay_first_vertex: usize,
 
     head_joint: i32,
     arm_chain: ArmChain,
@@ -236,6 +245,8 @@ fn init(allocator: std.mem.Allocator, io: std.Io, window: *zglfw.Window) !DemoSt
 
     var run = try zozz.Animation.loadFromFileZ("assets/ual_run.ozz");
     errdefer run.deinit();
+    var recoil = try zozz.Animation.loadFromFileZ("assets/ual_pistol_shoot_additive.ozz");
+    errdefer recoil.deinit();
 
     var inst = try zozz.Instance.init(allocator, skeleton);
     errdefer inst.deinit(allocator);
@@ -248,6 +259,19 @@ fn init(allocator: std.mem.Allocator, io: std.Io, window: *zglfw.Window) !DemoSt
     errdefer allocator.free(joint_parents);
     for (joint_parents, 0..) |*parent, joint| {
         parent.* = skeleton.jointParent(@intCast(joint));
+    }
+    const upper_body_mask = try allocator.alloc(f32, joint_count);
+    errdefer allocator.free(upper_body_mask);
+    const upper_body_root = skeleton.findJointZ("spine_03");
+    for (upper_body_mask, 0..) |*weight, joint| {
+        var ancestor: i32 = @intCast(joint);
+        weight.* = 0;
+        while (ancestor >= 0) : (ancestor = skeleton.jointParent(ancestor)) {
+            if (ancestor == upper_body_root) {
+                weight.* = 1;
+                break;
+            }
+        }
     }
 
     const bone_vertices = if (joint_count > 0) (joint_count - 1) * 2 else 0;
@@ -284,13 +308,16 @@ fn init(allocator: std.mem.Allocator, io: std.Io, window: *zglfw.Window) !DemoSt
         .skeleton = skeleton,
         .walk = walk,
         .run = run,
+        .recoil = recoil,
         .inst = inst,
         .ws = ws,
         .joint_parents = joint_parents,
+        .upper_body_mask = upper_body_mask,
         .line_vertices = line_vertices,
         .mesh = mesh,
         .skinned_vertices = skinned_vertices,
         .mesh_vertices = mesh_vertices,
+        .overlay_first_vertex = 0,
         .head_joint = skeleton.findJointZ("Head"),
         .arm_chain = resolveArmChain(skeleton),
         .controls = .{},
@@ -307,10 +334,12 @@ fn deinit(allocator: std.mem.Allocator, demo: *DemoState) void {
     allocator.free(demo.skinned_vertices);
     demo.mesh.deinit(allocator);
     allocator.free(demo.line_vertices);
+    allocator.free(demo.upper_body_mask);
     allocator.free(demo.joint_parents);
     demo.ws.deinit(allocator);
     demo.inst.deinit(allocator);
     demo.run.deinit();
+    demo.recoil.deinit();
     demo.walk.deinit();
     demo.skeleton.deinit();
     demo.gctx.destroy(allocator);
@@ -401,6 +430,16 @@ fn draw(demo: *DemoState) !void {
                 pass.setIndexBuffer(mesh_ib.gpuobj.?, .uint32, 0, mesh_ib.size);
                 pass.setPipeline(mesh_pipeline);
                 pass.drawIndexed(@intCast(demo.mesh.indices.len), 1, 0, 0, 0);
+                if (vertex_count > demo.overlay_first_vertex) {
+                    pass.setVertexBuffer(0, vb_info.gpuobj.?, 0, vb_info.size);
+                    pass.setPipeline(pipeline);
+                    pass.draw(
+                        @intCast(vertex_count - demo.overlay_first_vertex),
+                        1,
+                        @intCast(demo.overlay_first_vertex),
+                        0,
+                    );
+                }
             } else {
                 pass.setVertexBuffer(0, vb_info.gpuobj.?, 0, vb_info.size);
                 pass.setPipeline(pipeline);
@@ -443,9 +482,17 @@ fn updateSkeletonVertices(demo: *DemoState, time_seconds: f32) !usize {
     demo.locomotion_phase = @mod(demo.locomotion_phase + dt * locomotion_frequency, 1.0);
     const locomotion_phase = demo.locomotion_phase;
 
+    var recoil_layer = zozz.Layer.atRatio(
+        demo.recoil,
+        @mod(time_seconds / @max(demo.recoil.duration(), 1e-5), 1.0),
+        if (demo.controls.enable_additive) 1.0 else 0.0,
+        .additive,
+    );
+    recoil_layer.joint_weights = demo.upper_body_mask;
     demo.inst.setLayers(&[_]zozz.Layer{
         zozz.Layer.atRatio(demo.walk, locomotion_phase, 1.0 - blend, .normal),
         zozz.Layer.atRatio(demo.run, locomotion_phase, blend, .normal),
+        recoil_layer,
     });
     demo.inst.setIkJobs(&.{});
 
@@ -487,7 +534,7 @@ fn updateSkeletonVertices(demo: *DemoState, time_seconds: f32) !usize {
             toVec3(target_ms),
             axisChoiceVec3(demo.controls.arm_pole_axis),
             axisChoiceVec3(demo.controls.elbow_axis),
-            0.0,
+            demo.controls.arm_twist,
             demo.controls.arm_soften,
             demo.controls.arm_weight,
         );
@@ -510,6 +557,7 @@ fn updateSkeletonVertices(demo: *DemoState, time_seconds: f32) !usize {
         const color = lineColor(joint, demo.joint_parents.len);
         appendLine(demo.line_vertices, &vertex_count, parent_pos, joint_pos, color);
     }
+    demo.overlay_first_vertex = vertex_count;
 
     if (demo.controls.show_target) {
         appendTargetMarker(demo.line_vertices, &vertex_count, target_ms);
@@ -527,8 +575,20 @@ fn updateSkeletonVertices(demo: *DemoState, time_seconds: f32) !usize {
         demo.current_hand_distance = 0.0;
     }
 
+    if (demo.controls.enable_arm_ik and demo.arm_chain.isValid()) {
+        const shoulder = paletteTranslation(palette, @intCast(demo.arm_chain.start_joint));
+        const pole = axisChoiceArray(demo.controls.arm_pole_axis);
+        appendLine(
+            demo.line_vertices,
+            &vertex_count,
+            shoulder,
+            addScaled3(shoulder, pole, 0.45),
+            .{ 1.0, 0.20, 0.85 },
+        );
+    }
+
     if (demo.controls.show_joint_axes) {
-        if (demo.head_joint >= 0) {
+        if (demo.controls.enable_head_aim and demo.head_joint >= 0) {
             appendJointBasis(
                 demo.line_vertices,
                 &vertex_count,
@@ -537,7 +597,7 @@ fn updateSkeletonVertices(demo: *DemoState, time_seconds: f32) !usize {
                 joint_axis_extent,
             );
         }
-        if (demo.arm_chain.isValid()) {
+        if (demo.controls.enable_arm_ik and demo.arm_chain.isValid()) {
             appendJointBasis(
                 demo.line_vertices,
                 &vertex_count,
@@ -546,7 +606,7 @@ fn updateSkeletonVertices(demo: *DemoState, time_seconds: f32) !usize {
                 joint_axis_extent,
             );
         }
-        if (demo.arm_chain.isValid()) {
+        if (demo.controls.enable_arm_ik and demo.arm_chain.isValid()) {
             appendJointBasis(
                 demo.line_vertices,
                 &vertex_count,
@@ -555,7 +615,7 @@ fn updateSkeletonVertices(demo: *DemoState, time_seconds: f32) !usize {
                 joint_axis_extent,
             );
         }
-        if (demo.arm_chain.isValid()) {
+        if (demo.controls.enable_arm_ik and demo.arm_chain.isValid()) {
             appendJointBasis(
                 demo.line_vertices,
                 &vertex_count,
@@ -615,6 +675,11 @@ fn axisChoiceVec3(choice: AxisChoice) zozz.Vec3 {
     };
 }
 
+fn axisChoiceArray(choice: AxisChoice) [3]f32 {
+    const value = axisChoiceVec3(choice);
+    return .{ value.x, value.y, value.z };
+}
+
 fn axisChoiceLabel(choice: AxisChoice) [:0]const u8 {
     return switch (choice) {
         .pos_x => "+X",
@@ -664,9 +729,9 @@ fn onOff(value: bool) []const u8 {
 fn printControls() void {
     std.debug.print(
         \\Controls:
-        \\  M mesh/skeleton   1 auto blend   3 arm IK   4 head aim   5 target marker   6 orbit camera   7 joint axes
+        \\  M mesh/skeleton   1 auto blend   2 additive recoil   3 arm IK   4 head aim   5 target marker   6 orbit camera   7 joint axes
         \\  Q elbow axis   Y arm pole axis   W head forward axis   E head up axis
-        \\  A/D blend      S/F arm weight        G/H arm soften
+        \\  A/D blend      S/F arm weight        G/H arm soften      J/K arm twist
         \\  X/C head weight
         \\  R/T target forward     V/B target lift
         \\  Space reset controls   / print this help   Esc quit
@@ -688,7 +753,7 @@ fn printResolvedJoints(demo: *const DemoState) void {
 
 fn printControlState(demo: *const DemoState) void {
     std.debug.print(
-        "State: blend={d:.2} auto={s} add={s} arm={s} head={s} target={s} axes={s} orbit={s} arm_weight={d:.2} arm_soften={d:.2} hand_dist={d:.3} head_weight={d:.2} target_forward={d:.2} target_lift={d:.2} elbow={s} arm_pole={s} head_forward={s} head_up={s}\n",
+        "State: blend={d:.2} auto={s} add={s} arm={s} head={s} target={s} axes={s} orbit={s} arm_weight={d:.2} arm_soften={d:.2} arm_twist={d:.2} hand_dist={d:.3} head_weight={d:.2} target_forward={d:.2} target_lift={d:.2} elbow={s} arm_pole={s} head_forward={s} head_up={s}\n",
         .{
             demo.controls.blend,
             onOff(demo.controls.auto_blend),
@@ -700,6 +765,7 @@ fn printControlState(demo: *const DemoState) void {
             onOff(demo.controls.orbit_camera),
             demo.controls.arm_weight,
             demo.controls.arm_soften,
+            demo.controls.arm_twist,
             demo.current_hand_distance,
             demo.controls.head_weight,
             demo.controls.target_forward,
@@ -790,6 +856,12 @@ fn handleInput(window: *zglfw.Window, demo: *DemoState) void {
     if (consumeEdge(window, .h, &demo.input.arm_soften_up)) {
         changed = stepClamped(&demo.controls.arm_soften, 0.05, 0.0, 1.0) or changed;
     }
+    if (consumeEdge(window, .j, &demo.input.arm_twist_down)) {
+        changed = stepClamped(&demo.controls.arm_twist, -0.10, -math.pi, math.pi) or changed;
+    }
+    if (consumeEdge(window, .k, &demo.input.arm_twist_up)) {
+        changed = stepClamped(&demo.controls.arm_twist, 0.10, -math.pi, math.pi) or changed;
+    }
     if (consumeEdge(window, .x, &demo.input.head_weight_down)) {
         changed = stepClamped(&demo.controls.head_weight, -0.05, 0.0, 1.0) or changed;
     }
@@ -818,7 +890,7 @@ fn updateWindowTitle(window: *zglfw.Window, demo: *const DemoState) void {
     var buffer: [256]u8 = undefined;
     const title = std.fmt.bufPrintZ(
         &buffer,
-        "{s} | view {s} | blend {d:.2} | arm {s} {d:.2} s{d:.2} d{d:.3} | pole {s} | head {s} {d:.2} | axes {s} | elbow {s}",
+        "{s} | view {s} | blend {d:.2} | arm {s} {d:.2} s{d:.2} twist {d:.2} d{d:.3} | pole {s} | head {s} {d:.2} | axes {s} | elbow {s}",
         .{
             window_title,
             if (demo.controls.show_mesh) "mesh" else "skeleton",
@@ -826,6 +898,7 @@ fn updateWindowTitle(window: *zglfw.Window, demo: *const DemoState) void {
             onOff(demo.controls.enable_arm_ik),
             demo.controls.arm_weight,
             demo.controls.arm_soften,
+            demo.controls.arm_twist,
             demo.current_hand_distance,
             axisChoiceLabel(demo.controls.arm_pole_axis),
             onOff(demo.controls.enable_head_aim),

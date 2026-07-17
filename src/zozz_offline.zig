@@ -85,6 +85,16 @@ pub fn buildAnimation(name: [*:0]const u8, duration: f32, tracks: []const Track,
     ));
 }
 
+pub fn buildAdditiveAnimation(name: [*:0]const u8, duration: f32, tracks: []const Track, output_path: [*:0]const u8) Error!void {
+    try check(c.ozz_offline_build_additive_animation(
+        name,
+        duration,
+        if (tracks.len == 0) null else @ptrCast(tracks.ptr),
+        tracks.len,
+        output_path,
+    ));
+}
+
 test "offline ABI rejects non-depth-first skeletons" {
     const joints = [_]Joint{
         .{ .name = "root", .parent = -1 },

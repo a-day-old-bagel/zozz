@@ -61,6 +61,13 @@ ozz_offline_result_t ozz_offline_build_animation(
     const ozz_offline_track_t* tracks, size_t track_count,
     const char* output_path);
 
+/* Converts the supplied absolute tracks to deltas relative to their first
+   frame before building the runtime animation. */
+ozz_offline_result_t ozz_offline_build_additive_animation(
+    const char* name, float duration,
+    const ozz_offline_track_t* tracks, size_t track_count,
+    const char* output_path);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
