@@ -65,10 +65,9 @@ pub fn build(b: *std.Build) void {
         .files = &.{
             "cozz/cozz_offline.cpp",
 
+            "ozz/src_fused/ozz_base.cc",
+            "ozz/src_fused/ozz_animation.cc",
             "ozz/src_fused/ozz_animation_offline.cc",
-            "ozz/src_fused/ozz_animation_tools.cc",
-
-            "libs/jsoncpp.cpp",
         },
         .flags = &.{
             "-std=c++20",
@@ -77,10 +76,26 @@ pub fn build(b: *std.Build) void {
     cozz_offline.root_module.link_libc = true;
     cozz_offline.root_module.link_libcpp = true;
 
+    const importer = b.addExecutable(.{
+        .name = "zozz-import",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/zozz_import.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    importer.root_module.addIncludePath(b.path("cozz"));
+    importer.root_module.linkLibrary(cozz_offline);
+    b.installArtifact(importer);
+    const importer_step = b.step("importer", "Build the glTF/GLB to ozz importer");
+    importer_step.dependOn(&b.addInstallArtifact(importer, .{}).step);
+
     //
     // Example
     //
 
+    const build_examples = b.option(bool, "examples", "Build graphical examples") orelse false;
+    if (build_examples) {
     const debug_skeleton = buildDebugSkeletonExample(b, .{
         .target = target,
         .optimize = optimize,
@@ -106,6 +121,7 @@ pub fn build(b: *std.Build) void {
 
     const debug_skeleton_run_step = b.step("debug-skeleton-run", "Build and run the debug skeleton WGPU example");
     debug_skeleton_run_step.dependOn(&run_debug_skeleton.step);
+    }
 
     //
     // Tests
@@ -160,14 +176,12 @@ fn buildDebugSkeletonExample(b: *std.Build, options: ExampleOptions) *std.Build.
     exe.root_module.addImport("zglfw", zglfw.module("root"));
     exe.root_module.linkLibrary(zglfw.artifact("glfw"));
 
-    @import("zgpu").addLibraryPathsTo(exe);
     const zgpu = b.dependency("zgpu", .{
         .target = options.target,
         .optimize = options.optimize,
     });
     exe.root_module.addImport("zgpu", zgpu.module("root"));
     exe.root_module.linkLibrary(zgpu.artifact("zdawn"));
-    @import("zgpu").installDxcFrom(exe, "zwindows");
 
     const zmath = b.dependency("zmath", .{
         .target = options.target,

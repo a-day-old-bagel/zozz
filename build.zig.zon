@@ -7,18 +7,22 @@
         .zglfw = .{
             .url = "https://github.com/zig-gamedev/zglfw/archive/51003c105d23db378bb59ce415a387b22f1b0892.tar.gz",
             .hash = "zglfw-0.10.0-dev-zgVDNIy4IQDJNRy4jrP1As-SZxfJpuWhU1iJ-wBab_VD",
+            .lazy = true,
         },
         .zgpu = .{
             .url = "https://github.com/a-day-old-bagel/zgpu/archive/0d1f7f7116435a262fb6997f4ef31e64409cdc67.tar.gz",
             .hash = "zgpu-0.16.0-dev-nqFT5IzVBgDIsQ75TPBIB9bMe5iFkz9o2cgA7Hgb31OA",
+            .lazy = true,
         },
         .zmath = .{
             .url = "https://github.com/zig-gamedev/zmath/archive/9e42b04a24c970a297b365f3d3022f92dbf3219d.tar.gz",
             .hash = "zmath-0.11.0-dev-wjwivTwtAwDOjG2_KGP-HLtHrONfsFfHttalmxFAGVAK",
+            .lazy = true,
         },
         .zwindows = .{
             .url = "https://github.com/zig-gamedev/zwindows/archive/623c15d109ed1f900597a6c8f1372465a4bd9d0f.tar.gz",
             .hash = "zwindows-0.2.0-dev-xMZ1u_h5yQaHTycqsygTEa3Ca7aplFIaF7gJAEa2_kID",
+            .lazy = true,
         },
         .zdawn_x86_64_windows_gnu = .{
             .url = "https://github.com/a-day-old-bagel/libzdawn-binaries/archive/6f4aa6f43f79eb200b0c865907f62a8a95310786.tar.gz",
