@@ -31,7 +31,7 @@ typedef struct ozz_animation_t ozz_animation_t;
 typedef struct ozz_instance_t ozz_instance_t;   // per-entity persistent state
 typedef struct ozz_workspace_t ozz_workspace_t; // per-worker scratch/output
 
-enum { OZZ_MAX_LAYERS = 8 };
+enum { OZZ_MAX_LAYERS = 12 };
 enum { OZZ_MAX_IK_JOBS = 8 };
 
 typedef enum ozz_layer_mode_t {

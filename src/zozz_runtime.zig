@@ -358,8 +358,8 @@ pub const Instance = struct {
     }
 
     pub fn setLayers(self: *Instance, layers: []const Layer) void {
-        // Hard limit in the C wrapper is 8.
-        if (layers.len > c.OZZ_MAX_LAYERS) @panic("too many layers (max 8)");
+        if (layers.len > c.OZZ_MAX_LAYERS)
+            std.debug.panic("too many layers (max {})", .{c.OZZ_MAX_LAYERS});
 
         var tmp: [c.OZZ_MAX_LAYERS]c.ozz_layer_desc_t = undefined;
 
@@ -593,6 +593,28 @@ test "ozz C ABI wrapper: load + 2-clip blend + 3x4 palette is sane" {
         try std.testing.expect(std.math.isFinite(ty));
         try std.testing.expect(std.math.isFinite(tz));
     }
+}
+
+test "ozz C ABI wrapper evaluates an eleven-layer locomotion transition" {
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
+
+    var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
+    defer skel.deinit();
+    var walk = try Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
+    defer walk.deinit();
+    var inst = try Instance.init(A, skel);
+    defer inst.deinit(A);
+    var ws = try Workspace.init(A, skel);
+    defer ws.deinit(A);
+
+    var layers: [11]Layer = undefined;
+    for (&layers, 0..) |*layer, i| {
+        layer.* = Layer.atRatio(walk, @as(f32, @floatFromInt(i)) / 11.0, 1.0 / 11.0, .normal);
+    }
+    inst.setLayers(&layers);
+    const palette = try evalModel3x4(&inst, &ws);
+    try std.testing.expectEqual(@as(usize, @intCast(skel.numJoints())) * 12, palette.len);
 }
 
 test "skeleton joint parent queries are structurally sane" {
