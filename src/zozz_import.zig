@@ -18,6 +18,13 @@ pub fn main(init: std.process.Init) !void {
         try gltf.importAdditive(allocator, init.io, args[2], args[3], args[4], animation_index);
         return;
     }
+    if ((args.len == 7 or args.len == 8) and std.mem.eql(u8, args[1], "--range")) {
+        const start = try std.fmt.parseFloat(f32, args[2]);
+        const end = try std.fmt.parseFloat(f32, args[3]);
+        const animation_index = if (args.len == 8) try resolveSelector(allocator, init.io, args[4], args[7]) else 0;
+        try gltf.importRange(allocator, init.io, args[4], args[5], args[6], animation_index, .{ start, end });
+        return;
+    }
     if (args.len == 4 and std.mem.eql(u8, args[1], "--all")) {
         const names = try gltf.animationNames(allocator, init.io, args[2]);
         try std.Io.Dir.cwd().createDirPath(init.io, args[3]);
@@ -37,8 +44,8 @@ pub fn main(init: std.process.Init) !void {
 
 fn usage(exe: []const u8) error{InvalidArguments} {
     std.log.err(
-        "usage:\n  {s} --list <input.gltf|input.glb>\n  {s} --all <input.gltf|input.glb> <output-directory>\n  {s} --mesh <input.gltf|input.glb> <output.zmesh>\n  {s} --additive <input> <skeleton.ozz> <animation.ozz> <index-or-name>\n  {s} <input> <skeleton.ozz> <animation.ozz> [animation-index-or-name]",
-        .{ exe, exe, exe, exe, exe },
+        "usage:\n  {s} --list <input.gltf|input.glb>\n  {s} --all <input.gltf|input.glb> <output-directory>\n  {s} --mesh <input.gltf|input.glb> <output.zmesh>\n  {s} --additive <input> <skeleton.ozz> <animation.ozz> <index-or-name>\n  {s} --range <start-seconds> <end-seconds> <input> <skeleton.ozz> <animation.ozz> [index-or-name]\n  {s} <input> <skeleton.ozz> <animation.ozz> [animation-index-or-name]",
+        .{ exe, exe, exe, exe, exe, exe },
     );
     return error.InvalidArguments;
 }

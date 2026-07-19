@@ -124,7 +124,11 @@ fn readIntegerAccessor(allocator: std.mem.Allocator, root: std.json.ObjectMap, b
     if (accessor_index >= accessors.len or accessors[accessor_index] != .object) return error.InvalidGltf;
     const accessor = accessors[accessor_index].object;
     const component_type = try index(try field(accessor, "componentType"));
-    const component_bytes: usize = switch (component_type) { 5121 => 1, 5123 => 2, else => return error.UnsupportedGltf };
+    const component_bytes: usize = switch (component_type) {
+        5121 => 1,
+        5123 => 2,
+        else => return error.UnsupportedGltf,
+    };
     const count = try index(try field(accessor, "count"));
     const kind = (try field(accessor, "type")).string;
     const components: usize = if (std.mem.eql(u8, kind, "SCALAR")) 1 else if (std.mem.eql(u8, kind, "VEC4")) 4 else return error.UnsupportedGltf;
@@ -232,12 +236,31 @@ pub fn importMesh(allocator: std.mem.Allocator, io: std.Io, input_path: []const 
         for (0..count) |v| {
             const offset = header_size + (vertex_base + v) * vertex_stride;
             var cursor = offset;
-            for (positions[v * 3 ..][0..3]) |value| { std.mem.writeInt(u32, output[cursor..][0..4], @bitCast(value), .little); cursor += 4; }
-            for (normals[v * 3 ..][0..3]) |value| { std.mem.writeInt(u32, output[cursor..][0..4], @bitCast(value), .little); cursor += 4; }
-            for (uvs[v * 2 ..][0..2]) |value| { std.mem.writeInt(u32, output[cursor..][0..4], @bitCast(value), .little); cursor += 4; }
-            for (joints.values[v * 4 ..][0..4]) |joint| { if (joint >= old_to_new.len) return error.InvalidGltf; std.mem.writeInt(u16, output[cursor..][0..2], @intCast(old_to_new[joint]), .little); cursor += 2; }
-            for (weights[v * 4 ..][0..4]) |value| { std.mem.writeInt(u32, output[cursor..][0..4], @bitCast(value), .little); cursor += 4; }
-            for (color) |value| { std.mem.writeInt(u32, output[cursor..][0..4], @bitCast(value), .little); cursor += 4; }
+            for (positions[v * 3 ..][0..3]) |value| {
+                std.mem.writeInt(u32, output[cursor..][0..4], @bitCast(value), .little);
+                cursor += 4;
+            }
+            for (normals[v * 3 ..][0..3]) |value| {
+                std.mem.writeInt(u32, output[cursor..][0..4], @bitCast(value), .little);
+                cursor += 4;
+            }
+            for (uvs[v * 2 ..][0..2]) |value| {
+                std.mem.writeInt(u32, output[cursor..][0..4], @bitCast(value), .little);
+                cursor += 4;
+            }
+            for (joints.values[v * 4 ..][0..4]) |joint| {
+                if (joint >= old_to_new.len) return error.InvalidGltf;
+                std.mem.writeInt(u16, output[cursor..][0..2], @intCast(old_to_new[joint]), .little);
+                cursor += 2;
+            }
+            for (weights[v * 4 ..][0..4]) |value| {
+                std.mem.writeInt(u32, output[cursor..][0..4], @bitCast(value), .little);
+                cursor += 4;
+            }
+            for (color) |value| {
+                std.mem.writeInt(u32, output[cursor..][0..4], @bitCast(value), .little);
+                cursor += 4;
+            }
         }
         const indices = try readIntegerAccessor(allocator, root, binary, try index(try field(primitive, "indices")));
         if (indices.components != 1) return error.InvalidGltf;
@@ -249,7 +272,10 @@ pub fn importMesh(allocator: std.mem.Allocator, io: std.Io, input_path: []const 
         index_base += indices.values.len;
     }
     var inverse_cursor = header_size + vertex_count * vertex_stride;
-    for (inverse) |value| { std.mem.writeInt(u32, output[inverse_cursor..][0..4], @bitCast(value), .little); inverse_cursor += 4; }
+    for (inverse) |value| {
+        std.mem.writeInt(u32, output[inverse_cursor..][0..4], @bitCast(value), .little);
+        inverse_cursor += 4;
+    }
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output_path, .data = output });
 }
 
@@ -275,14 +301,18 @@ fn nodeTransform(node: std.json.ObjectMap) !offline.Transform {
 }
 
 pub fn import(allocator: std.mem.Allocator, io: std.Io, input_path: []const u8, skeleton_path: []const u8, animation_path: []const u8, animation_index: usize) !void {
-    return importAnimation(allocator, io, input_path, skeleton_path, animation_path, animation_index, false);
+    return importAnimation(allocator, io, input_path, skeleton_path, animation_path, animation_index, false, null);
+}
+
+pub fn importRange(allocator: std.mem.Allocator, io: std.Io, input_path: []const u8, skeleton_path: []const u8, animation_path: []const u8, animation_index: usize, time_range: [2]f32) !void {
+    return importAnimation(allocator, io, input_path, skeleton_path, animation_path, animation_index, false, time_range);
 }
 
 pub fn importAdditive(allocator: std.mem.Allocator, io: std.Io, input_path: []const u8, skeleton_path: []const u8, animation_path: []const u8, animation_index: usize) !void {
-    return importAnimation(allocator, io, input_path, skeleton_path, animation_path, animation_index, true);
+    return importAnimation(allocator, io, input_path, skeleton_path, animation_path, animation_index, true, null);
 }
 
-fn importAnimation(allocator: std.mem.Allocator, io: std.Io, input_path: []const u8, skeleton_path: []const u8, animation_path: []const u8, animation_index: usize, additive: bool) !void {
+fn importAnimation(allocator: std.mem.Allocator, io: std.Io, input_path: []const u8, skeleton_path: []const u8, animation_path: []const u8, animation_index: usize, additive: bool, time_range: ?[2]f32) !void {
     const input = try std.Io.Dir.cwd().readFileAlloc(io, input_path, allocator, .unlimited);
     const document = try parseDocument(allocator, input);
     const root = document.root.object;
@@ -370,7 +400,8 @@ fn importAnimation(allocator: std.mem.Allocator, io: std.Io, input_path: []const
             .scale_count = 1,
         };
     }
-    var duration: f32 = 0;
+    if (time_range) |range| if (!std.math.isFinite(range[0]) or !std.math.isFinite(range[1]) or range[0] < 0 or range[1] <= range[0]) return error.InvalidAnimationRange;
+    var duration: f32 = if (time_range) |range| range[1] - range[0] else 0;
     for (channels) |channel_value| {
         const channel = channel_value.object;
         const sampler_index = try index(try field(channel, "sampler"));
@@ -384,19 +415,28 @@ fn importAnimation(allocator: std.mem.Allocator, io: std.Io, input_path: []const
         const times = try readAccessor(allocator, root, binary, try index(try field(sampler, "input")));
         const values = try readAccessor(allocator, root, binary, try index(try field(sampler, "output")));
         if (times.len == 0) continue;
-        duration = @max(duration, times[times.len - 1]);
+        if (time_range == null) duration = @max(duration, times[times.len - 1]);
+        const bounds = try animationKeyBounds(times, time_range);
+        const key_count = bounds[1] - bounds[0] + 1;
+        const time_origin = if (time_range) |range| range[0] else 0;
         const path = (try field(target, "path")).string;
         if (std.mem.eql(u8, path, "rotation")) {
             if (values.len != times.len * 4) return error.InvalidGltf;
-            const keys = try allocator.alloc(offline.QuaternionKey, times.len);
-            for (times, 0..) |time, i| keys[i] = .{ .time = time, .value = .{ .x = values[i * 4], .y = values[i * 4 + 1], .z = values[i * 4 + 2], .w = values[i * 4 + 3] } };
+            const keys = try allocator.alloc(offline.QuaternionKey, key_count);
+            for (keys, bounds[0]..) |*key, i| key.* = .{ .time = if (times.len == 1) 0 else times[i] - time_origin, .value = .{ .x = values[i * 4], .y = values[i * 4 + 1], .z = values[i * 4 + 2], .w = values[i * 4 + 3] } };
             tracks[track_index].rotations = keys.ptr;
             tracks[track_index].rotation_count = keys.len;
         } else if (std.mem.eql(u8, path, "translation") or std.mem.eql(u8, path, "scale")) {
             if (values.len != times.len * 3) return error.InvalidGltf;
-            const keys = try allocator.alloc(offline.Vec3Key, times.len);
-            for (times, 0..) |time, i| keys[i] = .{ .time = time, .value = .{ .x = values[i * 3], .y = values[i * 3 + 1], .z = values[i * 3 + 2] } };
-            if (path[0] == 't') { tracks[track_index].translations = keys.ptr; tracks[track_index].translation_count = keys.len; } else { tracks[track_index].scales = keys.ptr; tracks[track_index].scale_count = keys.len; }
+            const keys = try allocator.alloc(offline.Vec3Key, key_count);
+            for (keys, bounds[0]..) |*key, i| key.* = .{ .time = if (times.len == 1) 0 else times[i] - time_origin, .value = .{ .x = values[i * 3], .y = values[i * 3 + 1], .z = values[i * 3 + 2] } };
+            if (path[0] == 't') {
+                tracks[track_index].translations = keys.ptr;
+                tracks[track_index].translation_count = keys.len;
+            } else {
+                tracks[track_index].scales = keys.ptr;
+                tracks[track_index].scale_count = keys.len;
+            }
         }
     }
     if (duration <= 0) return error.InvalidGltf;
@@ -407,4 +447,18 @@ fn importAnimation(allocator: std.mem.Allocator, io: std.Io, input_path: []const
         try offline.buildAdditiveAnimation(animation_name_z.ptr, duration, tracks, animation_z.ptr)
     else
         try offline.buildAnimation(animation_name_z.ptr, duration, tracks, animation_z.ptr);
+}
+
+fn animationKeyBounds(times: []const f32, time_range: ?[2]f32) ![2]usize {
+    const range = time_range orelse return .{ 0, times.len - 1 };
+    if (times.len == 1) return .{ 0, 0 };
+    const tolerance: f32 = 0.0001;
+    var first: ?usize = null;
+    var last: ?usize = null;
+    for (times, 0..) |time, i| {
+        if (first == null and @abs(time - range[0]) <= tolerance) first = i;
+        if (@abs(time - range[1]) <= tolerance) last = i;
+    }
+    if (first == null or last == null or last.? <= first.?) return error.AnimationRangeMustAlignWithKeys;
+    return .{ first.?, last.? };
 }

@@ -34,10 +34,12 @@ name. Animation discovery and bulk extraction are also available:
 zig-out/bin/zozz-import --list character.glb
 zig-out/bin/zozz-import --all character.glb compiled-animations
 zig-out/bin/zozz-import --additive character.glb character-skeleton.ozz recoil.ozz Pistol_Shoot
+zig-out/bin/zozz-import --range 0.4 2.4 character.glb character-skeleton.ozz walk-loop.ozz Walk_Loop
 ```
 
 `--all` writes `skeleton.ozz` and one sanitized, name-based `.ozz` file per
-animation into the output directory. The
+animation into the output directory. `--range` trims an animation to key-aligned
+start and end times and shifts the retained keys to begin at zero. The
 importer supports `.glb`, `.gltf` with an external buffer, and base64 data-URI
 buffers. Animation accessors must use float components and `LINEAR`
 interpolation. Joint rest poses must currently be expressed as TRS; node
