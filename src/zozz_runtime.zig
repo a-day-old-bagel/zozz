@@ -332,6 +332,18 @@ pub const Layer = struct {
     }
 };
 
+pub const LocalPose = enum(u32) {
+    pose_0,
+    pose_1,
+    pose_2,
+    pose_3,
+};
+
+pub const LocalPoseLayer = struct {
+    pose: LocalPose,
+    weight: f32,
+};
+
 // --------------------
 // Per-entity Instance
 // --------------------
@@ -448,6 +460,34 @@ pub const Workspace = struct {
 
 pub fn evalModel3x4(inst: *Instance, ws: *Workspace) ![]const f32 {
     try mapResult(c.ozz_eval_model_3x4(inst.handle, ws.handle));
+    return ws.palette3x4();
+}
+
+pub fn evalLocalPose(inst: *Instance, ws: *Workspace, pose: LocalPose) !void {
+    try mapResult(c.ozz_eval_local_pose(inst.handle, ws.handle, @intCast(@intFromEnum(pose))));
+}
+
+pub fn evalLocalPoseLayersModel3x4(
+    inst: *Instance,
+    ws: *Workspace,
+    layers: []const LocalPoseLayer,
+) ![]const f32 {
+    if (layers.len == 0 or layers.len > c.OZZ_MAX_LOCAL_POSES)
+        return OzzError.InvalidArgument;
+
+    var tmp: [c.OZZ_MAX_LOCAL_POSES]c.ozz_local_pose_layer_desc_t = undefined;
+    for (layers, 0..) |layer, i| {
+        tmp[i] = .{
+            .pose = @intCast(@intFromEnum(layer.pose)),
+            .weight = layer.weight,
+        };
+    }
+    try mapResult(c.ozz_eval_local_pose_layers_model_3x4(
+        inst.handle,
+        ws.handle,
+        &tmp[0],
+        @intCast(layers.len),
+    ));
     return ws.palette3x4();
 }
 
@@ -615,6 +655,39 @@ test "ozz C ABI wrapper evaluates an eleven-layer locomotion transition" {
     inst.setLayers(&layers);
     const palette = try evalModel3x4(&inst, &ws);
     try std.testing.expectEqual(@as(usize, @intCast(skel.numJoints())) * 12, palette.len);
+}
+
+test "workspace local poses compose independently evaluated animation groups" {
+    const A = testAllocator();
+    defer resetAllocator() catch unreachable;
+
+    var skel = try Skeleton.loadFromFileZ("assets/pab_skeleton.ozz");
+    defer skel.deinit();
+    var walk = try Animation.loadFromFileZ("assets/pab_walk_no_motion.ozz");
+    defer walk.deinit();
+    var jog = try Animation.loadFromFileZ("assets/pab_jog_no_motion.ozz");
+    defer jog.deinit();
+    var inst = try Instance.init(A, skel);
+    defer inst.deinit(A);
+    var ws = try Workspace.init(A, skel);
+    defer ws.deinit(A);
+
+    inst.setLayers(&.{Layer.atRatio(walk, 0.2, 1, .normal)});
+    const direct = try copyPalette(A, try evalModel3x4(&inst, &ws));
+    defer A.free(direct);
+    try evalLocalPose(&inst, &ws, .pose_0);
+    const round_trip = try evalLocalPoseLayersModel3x4(&inst, &ws, &.{.{ .pose = .pose_0, .weight = 1 }});
+    try expectSlicesApproxEqAbs(direct, round_trip, 1e-4);
+
+    inst.setLayers(&.{Layer.atRatio(jog, 0.6, 1, .normal)});
+    try evalLocalPose(&inst, &ws, .pose_1);
+    const palette = try evalLocalPoseLayersModel3x4(&inst, &ws, &.{
+        .{ .pose = .pose_0, .weight = 0.25 },
+        .{ .pose = .pose_1, .weight = 0.75 },
+    });
+
+    try std.testing.expectEqual(@as(usize, @intCast(skel.numJoints())) * 12, palette.len);
+    for (palette) |value| try std.testing.expect(std.math.isFinite(value));
 }
 
 test "skeleton joint parent queries are structurally sane" {

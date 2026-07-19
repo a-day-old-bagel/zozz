@@ -33,6 +33,7 @@ typedef struct ozz_workspace_t ozz_workspace_t; // per-worker scratch/output
 
 enum { OZZ_MAX_LAYERS = 12 };
 enum { OZZ_MAX_IK_JOBS = 8 };
+enum { OZZ_MAX_LOCAL_POSES = 4 };
 
 typedef enum ozz_layer_mode_t {
   OZZ_LAYER_NORMAL = 0,
@@ -47,6 +48,11 @@ typedef struct ozz_layer_desc_t {
   const float* joint_weights;   // optional scalar weights, one per joint
   int32_t joint_weights_count;  // expected to be >= skeleton joint count
 } ozz_layer_desc_t;
+
+typedef struct ozz_local_pose_layer_desc_t {
+  int32_t pose;
+  float weight;
+} ozz_local_pose_layer_desc_t;
 
 typedef struct ozz_vec3_t { float x, y, z; } ozz_vec3_t;
 
@@ -106,6 +112,17 @@ void ozz_workspace_deinit(ozz_workspace_t* ws);
 // Evaluate: writes palette into workspace
 // Palette format: float[12*num_joints], column-major 3x4 per joint.
 ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws);
+
+// Blends the instance's current animation layers into a workspace-local pose.
+// Pose slots remain valid until the workspace is used by another evaluation.
+ozz_result_t ozz_eval_local_pose(ozz_instance_t* inst, ozz_workspace_t* ws, int32_t pose);
+
+// Blends workspace-local poses, applies the instance's IK jobs, and writes the palette.
+ozz_result_t ozz_eval_local_pose_layers_model_3x4(
+    ozz_instance_t* inst,
+    ozz_workspace_t* ws,
+    const ozz_local_pose_layer_desc_t* layers,
+    int32_t count);
 
 // Access palette from workspace (valid until next eval on that workspace)
 const float* ozz_workspace_palette_3x4(const ozz_workspace_t* ws);

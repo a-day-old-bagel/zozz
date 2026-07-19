@@ -304,6 +304,7 @@ struct ozz_workspace_t {
 
   ozz::math::SoaTransform* sampled_normal;   // [OZZ_MAX_LAYERS * num_soa]
   ozz::math::SoaTransform* sampled_additive; // [OZZ_MAX_LAYERS * num_soa]
+  ozz::math::SoaTransform* local_poses;      // [OZZ_MAX_LOCAL_POSES * num_soa]
   ozz::math::Float4x4* model;         // scratch
   float* palette;                     // output: 12*num_joints floats
 };
@@ -432,6 +433,7 @@ size_t ozz_workspace_required_bytes(const ozz_skeleton_t* skel_h) {
   bump(sizeof(ozz_workspace_t), alignof(ozz_workspace_t));
   bump(sizeof(ozz::math::SoaTransform) * (size_t)(ns * OZZ_MAX_LAYERS), alignof(ozz::math::SoaTransform)); // sampled_normal
   bump(sizeof(ozz::math::SoaTransform) * (size_t)(ns * OZZ_MAX_LAYERS), alignof(ozz::math::SoaTransform)); // sampled_additive
+  bump(sizeof(ozz::math::SoaTransform) * (size_t)(ns * OZZ_MAX_LOCAL_POSES), alignof(ozz::math::SoaTransform)); // local_poses
   bump(sizeof(ozz::math::Float4x4) * (size_t)n, alignof(ozz::math::Float4x4));          // model
   bump(sizeof(float) * (size_t)(12 * n), alignof(float));                               // palette
   return bytes;
@@ -457,6 +459,9 @@ ozz_result_t ozz_workspace_init(void* mem, size_t mem_bytes, const ozz_skeleton_
 
   ws->sampled_additive = bump_alloc<ozz::math::SoaTransform>(cur, left, (size_t)(ws->num_soa * OZZ_MAX_LAYERS));
   if (!ws->sampled_additive) return set_err(OZZ_ERR_INVALID_ARGUMENT, "mem too small (sampled_additive)");
+
+  ws->local_poses = bump_alloc<ozz::math::SoaTransform>(cur, left, (size_t)(ws->num_soa * OZZ_MAX_LOCAL_POSES));
+  if (!ws->local_poses) return set_err(OZZ_ERR_INVALID_ARGUMENT, "mem too small (local_poses)");
 
   ws->model = bump_alloc<ozz::math::Float4x4>(cur, left, (size_t)ws->num_joints);
   if (!ws->model) return set_err(OZZ_ERR_INVALID_ARGUMENT, "mem too small (model)");
@@ -587,12 +592,17 @@ static inline void apply_joint_rotation_correction(
   locals[soa].rotation.w = ozz::math::simd_float4::LoadPtr(ws);
 }
 
-// ---- main eval ----
-ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
-  ozz_clear_error();
+static ozz_result_t validate_instance_workspace(ozz_instance_t* inst, ozz_workspace_t* ws) {
   if (!inst || !ws) return set_err(OZZ_ERR_INVALID_ARGUMENT, "null inst/ws");
   if (inst->skel != ws->skel) return set_err(OZZ_ERR_INVALID_ARGUMENT, "skeleton mismatch");
   if (inst->num_joints != ws->num_joints) return set_err(OZZ_ERR_INVALID_ARGUMENT, "size mismatch");
+  return OZZ_OK;
+}
+
+static ozz_result_t blend_current_layers(
+    ozz_instance_t* inst,
+    ozz_workspace_t* ws,
+    ozz::math::SoaTransform* output) {
   if (inst->layer_count <= 0) return set_err(OZZ_ERR_INVALID_ARGUMENT, "no layers");
 
   ozz::animation::BlendingJob::Layer normal_layers[OZZ_MAX_LAYERS];
@@ -639,12 +649,15 @@ ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
   blend_job.rest_pose = inst->skel->joint_rest_poses();
   blend_job.layers = ozz::span<const ozz::animation::BlendingJob::Layer>(normal_layers, normal_count);
   blend_job.additive_layers = ozz::span<const ozz::animation::BlendingJob::Layer>(additive_layers, additive_count);
-  blend_job.output = ozz::span<ozz::math::SoaTransform>(inst->accum, inst->num_soa);
+  blend_job.output = ozz::span<ozz::math::SoaTransform>(output, inst->num_soa);
 
   if (!blend_job.Validate()) return set_err(OZZ_ERR_OZZ, "blend validate failed");
   if (!blend_job.Run()) return set_err(OZZ_ERR_OZZ, "blend run failed");
 
-  // 3) IK
+  return OZZ_OK;
+}
+
+static ozz_result_t finish_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
   if (inst->ik_count > 0) {
     ozz_result_t r = locals_to_model(inst, inst->accum, ws->model);
     if (r != OZZ_OK) return set_err(r, "ltm pre-IK failed");
@@ -714,7 +727,6 @@ ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
     }
   }
 
-  // 4) final LTM + palette
   {
     ozz_result_t r = locals_to_model(inst, inst->accum, ws->model);
     if (r != OZZ_OK) return set_err(r, "ltm failed");
@@ -725,6 +737,68 @@ ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
   }
 
   return OZZ_OK;
+}
+
+// ---- main eval ----
+ozz_result_t ozz_eval_model_3x4(ozz_instance_t* inst, ozz_workspace_t* ws) {
+  ozz_clear_error();
+  ozz_result_t r = validate_instance_workspace(inst, ws);
+  if (r != OZZ_OK) return r;
+  r = blend_current_layers(inst, ws, inst->accum);
+  if (r != OZZ_OK) return r;
+  return finish_model_3x4(inst, ws);
+}
+
+ozz_result_t ozz_eval_local_pose(ozz_instance_t* inst, ozz_workspace_t* ws, int32_t pose) {
+  ozz_clear_error();
+  ozz_result_t r = validate_instance_workspace(inst, ws);
+  if (r != OZZ_OK) return r;
+  if (pose < 0 || pose >= OZZ_MAX_LOCAL_POSES) {
+    return set_err(OZZ_ERR_INVALID_ARGUMENT, "local pose index out of range");
+  }
+  return blend_current_layers(
+      inst,
+      ws,
+      ws->local_poses + (size_t)pose * (size_t)inst->num_soa);
+}
+
+ozz_result_t ozz_eval_local_pose_layers_model_3x4(
+    ozz_instance_t* inst,
+    ozz_workspace_t* ws,
+    const ozz_local_pose_layer_desc_t* layers,
+    int32_t count) {
+  ozz_clear_error();
+  ozz_result_t r = validate_instance_workspace(inst, ws);
+  if (r != OZZ_OK) return r;
+  if (!layers || count <= 0 || count > OZZ_MAX_LOCAL_POSES) {
+    return set_err(OZZ_ERR_INVALID_ARGUMENT, "invalid local pose layers");
+  }
+
+  ozz::animation::BlendingJob::Layer pose_layers[OZZ_MAX_LOCAL_POSES];
+  int32_t pose_count = 0;
+  for (int32_t i = 0; i < count; ++i) {
+    const ozz_local_pose_layer_desc_t& layer = layers[i];
+    if (layer.pose < 0 || layer.pose >= OZZ_MAX_LOCAL_POSES) {
+      return set_err(OZZ_ERR_INVALID_ARGUMENT, "local pose index out of range");
+    }
+    if (!std::isfinite(layer.weight) || layer.weight <= 0.f) continue;
+    pose_layers[pose_count].transform = ozz::span<const ozz::math::SoaTransform>(
+        ws->local_poses + (size_t)layer.pose * (size_t)inst->num_soa,
+        inst->num_soa);
+    pose_layers[pose_count].weight = layer.weight;
+    pose_layers[pose_count].joint_weights = ozz::span<const ozz::math::SimdFloat4>();
+    ++pose_count;
+  }
+  if (pose_count <= 0) return set_err(OZZ_ERR_INVALID_ARGUMENT, "no local pose layers");
+
+  ozz::animation::BlendingJob blend_job;
+  blend_job.threshold = 0.1f;
+  blend_job.rest_pose = inst->skel->joint_rest_poses();
+  blend_job.layers = ozz::span<const ozz::animation::BlendingJob::Layer>(pose_layers, pose_count);
+  blend_job.output = ozz::span<ozz::math::SoaTransform>(inst->accum, inst->num_soa);
+  if (!blend_job.Validate()) return set_err(OZZ_ERR_OZZ, "local pose blend validate failed");
+  if (!blend_job.Run()) return set_err(OZZ_ERR_OZZ, "local pose blend run failed");
+  return finish_model_3x4(inst, ws);
 }
 
 extern "C" ozz_result_t ozz_eval_model_3x4_reference(ozz_instance_t* inst, ozz_workspace_t* ws) {
